@@ -47,7 +47,7 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 # ---------- AI 解析（Google Gemini，免费层级；未配置时用本地规则兜底） ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 BOOKING_SCHEMA = {
     "type": "OBJECT",

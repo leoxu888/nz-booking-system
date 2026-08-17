@@ -596,7 +596,12 @@
               aiOk.value = true;
               aiMsg.value = '已成功自动入库！';
               aiText.value = '';
+              // 排班跳到新预约的日期，让它立刻可见（booking_time_local 形如 2026-08-19T15:00:00+12:00）
+              const day = (d.booking_time_local || '').slice(0, 10);
+              if (day) { fromDate.value = day; toDate.value = day; }
               loadBookings();
+              loadServices();
+              loadStats();
             } else {
               aiOk.value = false;
               aiMsg.value = d.detail || '解析失败';
