@@ -111,7 +111,16 @@
     .spinner { display: inline-block; width: 18px; height: 18px; border: 2.5px solid
                rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%;
                animation: spin .7s linear infinite; vertical-align: -3px; margin-right: 8px; }
+    .spinner-sm { width: 12px; height: 12px; border-width: 2px; border-color: rgba(0,0,0,.1);
+                  border-top-color: var(--sub); margin: 0 6px 0 0; vertical-align: -1px; }
+    .spinner-inline { vertical-align: -3px; margin-right: 6px;
+                      border-color: rgba(29,29,31,.15); border-top-color: var(--sub); }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .skel { background: linear-gradient(90deg, #ececf0 0%, #f5f5f7 50%, #ececf0 100%);
+            background-size: 200% 100%; animation: shimmer 1.2s ease-in-out infinite;
+            border-radius: 12px; }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    .opt-skel { height: 64px; margin: 8px 0; }
 
     .step-enter-active, .step-leave-active { transition: all .28s cubic-bezier(.3,.8,.3,1); }
     .step-enter-from { opacity: 0; transform: translateY(10px); }
@@ -167,9 +176,15 @@
                 <span class="tick" v-if="selectedService===s.id">✓</span>
               </span>
             </button>
-            <div v-if="services.length===0" class="empty">This shop has no services yet.</div>
+            <div v-if="initialLoading" class="opt-skel skel"></div>
+            <div v-if="initialLoading" class="opt-skel skel"></div>
+            <div v-if="initialLoading" class="opt-skel skel"></div>
+            <div v-if="!initialLoading && services.length===0" class="empty">This shop has no services yet.</div>
           </div>
-          <button class="btn" :disabled="!selectedService" @click="loadSlots">Next: pick a time</button>
+          <button class="btn" :disabled="!selectedService || loadingSlots" @click="loadSlots">
+            <span v-if="loadingSlots"><span class="spinner"></span>Loading times…</span>
+            <span v-else>Next: pick a time</span>
+          </button>
         </div>
 
         <!-- STEP 2: time -->
@@ -180,11 +195,14 @@
               <button class="navbtn" @click="shiftDay(-1)">‹</button>
               <div class="datepill">
                 <div class="d1">{{ prettyDate }}</div>
-                <div class="d2">{{ weekday }}</div>
+                <div class="d2">
+                  <span v-if="loadingSlots"><span class="spinner spinner-sm"></span>Loading…</span>
+                  <span v-else>{{ weekday }}</span>
+                </div>
               </div>
               <button class="navbtn" @click="shiftDay(1)">›</button>
             </div>
-            <div class="slots">
+            <div class="slots" v-if="!loadingSlots">
               <div v-for="sl in slots" :key="sl.start_local" class="slot"
                    :class="{sel: selectedSlot && selectedSlot.start_local===sl.start_local,
                             disabled: sl.disabled}"
@@ -192,7 +210,10 @@
                 {{ sl.label }}
               </div>
             </div>
-            <div v-if="slots.length===0" class="empty">No open times this day — try another date.</div>
+            <div class="slots" v-else>
+              <div v-for="i in 6" :key="i" class="opt-skel skel" style="height:48px;margin:0"></div>
+            </div>
+            <div v-if="!loadingSlots && slots.length===0" class="empty">No open times this day — try another date.</div>
           </div>
           <button class="btn" :disabled="!selectedSlot" @click="step='details'">Next: your details</button>
           <button class="btn ghost" @click="step='service'">Back</button>
@@ -292,6 +313,8 @@
         const custEmail = ref('');
         const detailsErr = ref('');
         const loading = ref(false);
+        const loadingSlots = ref(false);
+        const initialLoading = ref(true);
         const result = ref(null);
         const repeatWeekly = ref(false);
         const repeatWeeks = ref(8);
@@ -320,16 +343,23 @@
           dateObj.value.toLocaleDateString('en-NZ', { weekday: 'long', year: 'numeric' }));
 
         async function loadSlots() {
+          loadingSlots.value = true;
           const ds = localDateStr(dateObj.value);
-          const r = await fetch(`${base.value}/availability?service_id=${selectedService.value}&date=${ds}`);
-          const data = await r.json();
-          const now = Date.now();
-          slots.value = data.map(s => {
-            const t = new Date(s.start_local).getTime();
-            return { ...s, disabled: t <= now };
-          });
-          selectedSlot.value = null;
-          step.value = 'time';
+          try {
+            const r = await fetch(`${base.value}/availability?service_id=${selectedService.value}&date=${ds}`);
+            const data = await r.json();
+            const now = Date.now();
+            slots.value = data.map(s => {
+              const t = new Date(s.start_local).getTime();
+              return { ...s, disabled: t <= now };
+            });
+            selectedSlot.value = null;
+          } catch (e) {
+            slots.value = [];
+          } finally {
+            loadingSlots.value = false;
+            step.value = 'time';
+          }
         }
         function shiftDay(delta) {
           const d = new Date(dateObj.value);
@@ -402,10 +432,15 @@
           step.value = 'service'; loadServices();
         }
 
-        onMounted(() => { loadShop(); loadServices(); });
+        onMounted(async () => {
+          if (!slug.value) return;
+          await Promise.all([loadShop(), loadServices()]);
+          initialLoading.value = false;
+        });
         return { slug, codeInput, codeErr, goCode, shop, services, step, selectedService,
                  prettyDate, weekday, slots, selectedSlot, custName, custEmail, detailsErr,
-                 loading, result, serviceName, slotLabel, chooseService, loadSlots, shiftDay,
+                 loading, loadingSlots, initialLoading, result, serviceName, slotLabel,
+                 chooseService, loadSlots, shiftDay,
                  detailsValid, googleCalUrl, confirm, reset, repeatWeekly, repeatWeeks,
                  fmtSeries };
       }
