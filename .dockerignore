@@ -1,0 +1,11 @@
+# 不进镜像的文件（避免把密钥/本地数据/缓存打进 Docker 镜像）
+.env
+.env.*
+venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+.DS_Store
+.git
+.gitignore
