@@ -74,24 +74,33 @@ class _PGConn:
     - INSERT 自动补 RETURNING id，并在同一次 execute 内消费结果、写回 self._lastrowid。
     """
 
-    def __init__(self, raw):
+    def __init__(self, raw, pool=None):
         self._raw = raw
+        self._pool = pool
         self._cur = raw.cursor(cursor_factory=RealDictCursor)
         self._lastrowid = None  # 兼容 app 里 cur.lastrowid 的写法（psycopg2 无此特性）
+        self._broken = False
+
+    def _mark_broken(self):
+        self._broken = True
 
     def execute(self, sql, params=None):
-        sql = sql.replace("?", "%s")
-        up = sql.strip().upper()
-        # INSERT 自动补 RETURNING id，供 lastrowid 使用（ON CONFLICT 分支不需要）
-        if up.startswith("INSERT") and "RETURNING" not in up and "ON CONFLICT" not in up:
-            sql = sql + " RETURNING id"
-            up = up + " RETURNING ID"
-        self._cur.execute(sql, params or ())
-        self._lastrowid = None
-        if up.endswith("RETURNING ID"):
-            row = self._cur.fetchone()
-            self._lastrowid = row["id"] if row else None
-        return self
+        try:
+            sql = sql.replace("?", "%s")
+            up = sql.strip().upper()
+            # INSERT 自动补 RETURNING id，供 lastrowid 使用（ON CONFLICT 分支不需要）
+            if up.startswith("INSERT") and "RETURNING" not in up and "ON CONFLICT" not in up:
+                sql = sql + " RETURNING id"
+                up = up + " RETURNING ID"
+            self._cur.execute(sql, params or ())
+            self._lastrowid = None
+            if up.endswith("RETURNING ID"):
+                row = self._cur.fetchone()
+                self._lastrowid = row["id"] if row else None
+            return self
+        except Exception:
+            self._mark_broken()
+            raise
 
     def executescript(self, sql):
         # Postgres 没有 executescript；按分号拆成多条语句依次执行
@@ -99,12 +108,16 @@ class _PGConn:
             s = stmt.strip()
             if not s:
                 continue
-            self._cur.execute(s.replace("?", "%s"))
-            # 清掉可能残留的结果集，避免 psycopg2 "operation already in progress"
             try:
-                self._cur.fetchall()
+                self._cur.execute(s.replace("?", "%s"))
+                # 清掉可能残留的结果集，避免 psycopg2 "operation already in progress"
+                try:
+                    self._cur.fetchall()
+                except Exception:
+                    pass
             except Exception:
-                pass
+                self._mark_broken()
+                raise
         return None
 
     def fetchone(self):
@@ -118,24 +131,69 @@ class _PGConn:
         return self._lastrowid
 
     def commit(self):
-        self._raw.commit()
+        try:
+            self._raw.commit()
+        except Exception:
+            self._mark_broken()
+            raise
 
     def rollback(self):
-        self._raw.rollback()
+        try:
+            self._raw.rollback()
+        except Exception:
+            self._mark_broken()
+            raise
 
     def close(self):
+        # 关闭 cursor
         try:
             self._cur.close()
         except Exception:
-            pass
-        self._raw.close()
+            self._mark_broken()
+        # 池模式：把连接还回去；broken 则彻底关掉，避免坏连接污染池
+        if self._pool is not None:
+            try:
+                self._pool.putconn(self._raw, close=self._broken)
+            except Exception:
+                try:
+                    self._raw.close()
+                except Exception:
+                    pass
+        else:
+            try:
+                self._raw.close()
+            except Exception:
+                pass
+
+
+# ---------- Postgres 连接池（消除每次请求 200-500ms 的 TCP+TLS 握手） ----------
+_PG_POOL = None
+_PG_POOL_LOCK = None
+
+
+def _get_pg_pool():
+    """懒初始化全局连接池（单进程内只建一次）。maxconn=10 适配 Render 免费版的承载力。"""
+    global _PG_POOL, _PG_POOL_LOCK
+    if _PG_POOL is None:
+        if _PG_POOL_LOCK is None:
+            import threading
+            _PG_POOL_LOCK = threading.Lock()
+        with _PG_POOL_LOCK:
+            if _PG_POOL is None:
+                from psycopg2.pool import ThreadedConnectionPool
+                _PG_POOL = ThreadedConnectionPool(
+                    minconn=1, maxconn=10,
+                    dsn=DATABASE_URL, connect_timeout=10,
+                )
+    return _PG_POOL
 
 
 def get_conn():
-    """每次返回一个全新的连接。生产用 Postgres，本地回退 SQLite。"""
+    """每次返回一个连接包装。Postgres 走连接池（复用连接），本地 SQLite 走直连。"""
     if IS_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=30)
-        return _PGConn(conn)
+        pool = _get_pg_pool()
+        raw = pool.getconn()
+        return _PGConn(raw, pool=pool)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
