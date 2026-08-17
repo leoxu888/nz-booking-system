@@ -321,7 +321,16 @@ def build_ics(bid, service_name, name, email, phone, start_local_dt, end_local_d
 
 # ---------- 邮件辅助（免费：本地 SMTP；未配置时仅打印日志） ----------
 def _public_url():
-    return os.getenv("PUBLIC_URL", "http://localhost:8000")
+    """生成对外链接用的站点根地址。
+
+    优先级：手动配置 PUBLIC_URL > 平台自动注入的公开域名（Render 的
+    RENDER_EXTERNAL_URL）> 本地默认。修复「超管建店返回 localhost 链接」的问题。
+    """
+    return (
+        os.getenv("PUBLIC_URL")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or "http://localhost:8000"
+    )
 
 
 def google_cal_link(summary, start_local_dt, end_local_dt, details=""):
@@ -1020,7 +1029,7 @@ def customer_qr(slug: str):
         raise HTTPException(404, "shop not found")
     import io
     import qrcode
-    base = os.getenv("PUBLIC_URL", "http://localhost:8000")
+    base = _public_url()
     url = f"{base}/book/{slug}"
     img = qrcode.make(url)
     buf = io.BytesIO()
@@ -1069,9 +1078,9 @@ def admin_shop_info(request: Request):
     d["daily_capacity"] = s["daily_capacity"] or 0
     d["timezone"] = os.getenv("SHOP_TZ", "Pacific/Auckland")
     d["calendar_token"] = calendar_token(s["slug"])
-    d["booking_url"] = f"{os.getenv('PUBLIC_URL', 'http://localhost:8000')}/book/{s['slug']}"
-    d["qr_url"] = f"{os.getenv('PUBLIC_URL', 'http://localhost:8000')}/api/book/{s['slug']}/qr"
-    d["calendar_url"] = (f"{os.getenv('PUBLIC_URL', 'http://localhost:8000')}"
+    d["booking_url"] = f"{_public_url()}/book/{s['slug']}"
+    d["qr_url"] = f"{_public_url()}/api/book/{s['slug']}/qr"
+    d["calendar_url"] = (f"{_public_url()}"
                          f"/api/book/{s['slug']}/calendar.ics?t={d['calendar_token']}")
     d["blackout_dates"] = list_blackouts(s["id"])
     return d
@@ -1456,7 +1465,7 @@ def create_shop(request: Request, body: CreateShopIn):
     )
     conn.commit()
     conn.close()
-    base_url = os.getenv("PUBLIC_URL", "http://localhost:8000")
+    base_url = _public_url()
     return {
         "shop_id": sid,
         "name": body.shop_name,
@@ -1479,7 +1488,7 @@ def list_shops(request: Request):
         "FROM shops sh ORDER BY sh.id"
     ).fetchall()
     conn.close()
-    base_url = os.getenv("PUBLIC_URL", "http://localhost:8000")
+    base_url = _public_url()
     out = []
     for r in rows:
         d = dict(r)
