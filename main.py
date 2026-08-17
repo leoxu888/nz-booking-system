@@ -47,7 +47,7 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 # ---------- AI 解析（Google Gemini，免费层级；未配置时用本地规则兜底） ----------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 BOOKING_SCHEMA = {
     "type": "OBJECT",
@@ -561,6 +561,25 @@ def _resolve_time(text: str):
     m = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
     if m:
         return int(m.group(1)), int(m.group(2))
+    # 中文时间：下午3点 / 下午3点半 / 晚上8点 / 上午10点 / 3点 / 3点30分
+    m = re.search(r"(凌晨|早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*点(?:(\d{1,2})\s*分|半)?", text)
+    if m:
+        h = int(m.group(2))
+        mm = 0
+        if m.group(3):
+            mm = int(m.group(3))
+        elif m.group(0).endswith("半"):
+            mm = 30
+        period = m.group(1) or ""
+        if period in ("下午", "晚上"):
+            if h != 12:
+                h += 12
+        elif period in ("凌晨", "早上", "上午"):
+            if h == 12:
+                h = 0
+        elif period == "中午" and h < 12:
+            h += 12
+        return h, mm
     return None
 
 
@@ -610,6 +629,7 @@ def _resolve_name(text: str):
 
 
 _SERVICE_KEYWORDS = [
+    # English
     ("piano", "Piano lesson"),
     ("lesson", "Lesson"),
     ("haircut", "Haircut"),
@@ -621,6 +641,19 @@ _SERVICE_KEYWORDS = [
     ("session", "Session"),
     ("massage", "Massage"),
     ("cut", "Haircut"),
+    # 中文（本地兜底也能识别常见服务）
+    ("理发", "Haircut"),
+    ("剪发", "Haircut"),
+    ("剪头", "Haircut"),
+    ("造型", "Haircut"),
+    ("钢琴", "Piano lesson"),
+    ("上课", "Lesson"),
+    ("课程", "Lesson"),
+    ("健身", "Personal training"),
+    ("私教", "Personal training"),
+    ("训练", "Personal training"),
+    ("按摩", "Massage"),
+    ("理疗", "Massage"),
 ]
 
 
