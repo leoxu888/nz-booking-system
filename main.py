@@ -603,6 +603,13 @@ _DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "su
 def _resolve_date(text: str, now_akl):
     t = text.lower()
     today = now_akl.date()
+    # 明确 ISO 日期（如 2026-09-30）优先识别，避免被误判为「今天」
+    m = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", t)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+        except ValueError:
+            pass
     if "tomorrow" in t:
         return today + timedelta(days=1)
     if "today" in t:

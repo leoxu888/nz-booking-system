@@ -29,6 +29,8 @@
     .hero h1 { font-size: 30px; line-height: 1.1; letter-spacing: -0.02em;
                margin: 0 0 6px; font-weight: 700; }
     .hero p { color: var(--sub); margin: 0; font-size: 15px; }
+    .hero .tznote { margin-top: 6px; font-size: 13px; color: var(--sub); opacity: .8; }
+    .hero .tznote b { color: var(--ink); }
     .steps { display: flex; justify-content: center; gap: 6px; margin-top: 14px; }
     .stepdot { width: 26px; height: 4px; border-radius: 4px; background: var(--line);
                transition: background .3s ease; }
@@ -153,6 +155,7 @@
       <div class="hero">
         <h1>{{ shop.name || 'Book an appointment' }}</h1>
         <p>Pick a service &middot; choose a time &middot; we'll free-remind you</p>
+        <p class="tznote">All times shown in <b>Auckland time</b> (NZDT/NZST)</p>
         <div class="steps">
           <div class="stepdot" :class="{on: ['time','details','done'].includes(step)}"></div>
           <div class="stepdot" :class="{on: ['details','done'].includes(step)}"></div>
