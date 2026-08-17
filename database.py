@@ -64,24 +64,34 @@ DEFAULT_OPENING_HOURS = {
 
 # ---------- Postgres 适配层 ----------
 class _PGConn:
-    """把 psycopg2 连接包装成与 sqlite3 一致的接口，让上层代码无需区分后端。"""
+    """把 psycopg2 连接包装成与 sqlite3 一致的接口，让上层代码无需区分后端。
+
+    关键点：
+    - psycopg2 的 cursor 不允许赋值 cursor.lastrowid（readonly attribute），
+      所以 lastrowid 必须存在「包装对象」自身上，而不是底层 cursor。
+    - execute() 返回 self（包装对象），因此 conn.execute(...) 与
+      conn.execute(...).fetchone()/.fetchall()/.lastrowid 都能正常工作。
+    - INSERT 自动补 RETURNING id，并在同一次 execute 内消费结果、写回 self._lastrowid。
+    """
 
     def __init__(self, raw):
         self._raw = raw
         self._cur = raw.cursor(cursor_factory=RealDictCursor)
-        self._cur.lastrowid = None  # 兼容 app 里 cur.lastrowid 的写法
+        self._lastrowid = None  # 兼容 app 里 cur.lastrowid 的写法（psycopg2 无此特性）
 
     def execute(self, sql, params=None):
         sql = sql.replace("?", "%s")
         up = sql.strip().upper()
-        # INSERT 自动补 RETURNING id，供 cur.lastrowid 使用（ON CONFLICT 分支不需要）
+        # INSERT 自动补 RETURNING id，供 lastrowid 使用（ON CONFLICT 分支不需要）
         if up.startswith("INSERT") and "RETURNING" not in up and "ON CONFLICT" not in up:
-            sql += " RETURNING id"
+            sql = sql + " RETURNING id"
+            up = up + " RETURNING ID"
         self._cur.execute(sql, params or ())
+        self._lastrowid = None
         if up.endswith("RETURNING ID"):
             row = self._cur.fetchone()
-            self._cur.lastrowid = row["id"] if row else None
-        return self._cur
+            self._lastrowid = row["id"] if row else None
+        return self
 
     def executescript(self, sql):
         # Postgres 没有 executescript；按分号拆成多条语句依次执行
@@ -90,7 +100,22 @@ class _PGConn:
             if not s:
                 continue
             self._cur.execute(s.replace("?", "%s"))
+            # 清掉可能残留的结果集，避免 psycopg2 "operation already in progress"
+            try:
+                self._cur.fetchall()
+            except Exception:
+                pass
         return None
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    @property
+    def lastrowid(self):
+        return self._lastrowid
 
     def commit(self):
         self._raw.commit()
