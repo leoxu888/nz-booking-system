@@ -156,8 +156,12 @@ def to_utc_local(start_local_str: str):
 
 
 def get_shop_by_slug(slug: str):
+    """按 slug 查店铺；停用（active=0）的店铺对顾客端视为不存在。"""
     conn = get_conn()
-    row = conn.execute("SELECT * FROM shops WHERE slug = ?", (slug,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM shops WHERE slug = ? AND (active IS NULL OR active = 1)",
+        (slug,),
+    ).fetchone()
     conn.close()
     return row
 
@@ -1055,9 +1059,18 @@ def admin_login(body: OwnerLogin):
         "SELECT * FROM users WHERE username = ? AND role = 'shop_owner'",
         (body.username,),
     ).fetchone()
+    # 店铺被停用时，老板也不能登录
+    shop_active = True
+    if row:
+        sh = conn.execute(
+            "SELECT active FROM shops WHERE id = ?", (row["shop_id"],)
+        ).fetchone()
+        shop_active = sh is not None and (sh["active"] is None or sh["active"] == 1)
     conn.close()
     if not row or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(401, "wrong username or password")
+    if not shop_active:
+        raise HTTPException(403, "该店铺已被停用，请联系平台管理员")
     token = create_token({"sub": row["id"], "shop_id": row["shop_id"], "role": row["role"]})
     return {"token": token}
 
@@ -1482,7 +1495,7 @@ def list_shops(request: Request):
     require_role(request, "super_admin")
     conn = get_conn()
     rows = conn.execute(
-        "SELECT sh.id, sh.name, sh.slug, sh.created_at, "
+        "SELECT sh.id, sh.name, sh.slug, sh.created_at, sh.active, "
         "  (SELECT username FROM users WHERE shop_id = sh.id AND role='shop_owner' LIMIT 1) AS owner, "
         "  (SELECT COUNT(*) FROM bookings b WHERE b.shop_id = sh.id) AS bookings_count "
         "FROM shops sh ORDER BY sh.id"
@@ -1492,10 +1505,57 @@ def list_shops(request: Request):
     out = []
     for r in rows:
         d = dict(r)
+        d["active"] = 1 if d.get("active") is None else d["active"]
         d["booking_url"] = f"{base_url}/book/{r['slug']}"
         d["qr_url"] = f"{base_url}/api/book/{r['slug']}/qr"
         out.append(d)
     return out
+
+
+@app.post("/api/super-admin/shops/{sid}/deactivate")
+def deactivate_shop(request: Request, sid: int):
+    """停用店铺：顾客端访问预约页/API 全部返回 404，老板也不能登录；数据保留可恢复。"""
+    require_role(request, "super_admin")
+    conn = get_conn()
+    if not conn.execute("SELECT id FROM shops WHERE id = ?", (sid,)).fetchone():
+        conn.close()
+        raise HTTPException(404, "shop not found")
+    conn.execute("UPDATE shops SET active = 0 WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": sid, "active": False}
+
+
+@app.post("/api/super-admin/shops/{sid}/activate")
+def activate_shop(request: Request, sid: int):
+    """重新启用店铺。"""
+    require_role(request, "super_admin")
+    conn = get_conn()
+    if not conn.execute("SELECT id FROM shops WHERE id = ?", (sid,)).fetchone():
+        conn.close()
+        raise HTTPException(404, "shop not found")
+    conn.execute("UPDATE shops SET active = 1 WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": sid, "active": True}
+
+
+@app.delete("/api/super-admin/shops/{sid}")
+def delete_shop(request: Request, sid: int):
+    """彻底删除店铺及其全部数据（预约/服务/账号/关店日），不可恢复。"""
+    require_role(request, "super_admin")
+    conn = get_conn()
+    if not conn.execute("SELECT id FROM shops WHERE id = ?", (sid,)).fetchone():
+        conn.close()
+        raise HTTPException(404, "shop not found")
+    conn.execute("DELETE FROM bookings WHERE shop_id = ?", (sid,))
+    conn.execute("DELETE FROM blackout_dates WHERE shop_id = ?", (sid,))
+    conn.execute("DELETE FROM services WHERE shop_id = ?", (sid,))
+    conn.execute("DELETE FROM users WHERE shop_id = ?", (sid,))
+    conn.execute("DELETE FROM shops WHERE id = ?", (sid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": sid, "deleted": True}
 
 
 # ---------- 首次运行：种入演示店铺（方便立刻体验） ----------

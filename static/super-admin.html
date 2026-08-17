@@ -28,6 +28,10 @@
     .btn.ghost { background: #ececf0; color: var(--ink); }
     .btn.ghost:active { background: #e0e0e5; }
     .btn.sm { padding: 7px 12px; font-size: 13px; border-radius: 10px; }
+    .btn.danger { background: var(--red); }
+    .btn.danger:active { background: #b02f2f; }
+    .btn.soft { background: #fdecec; color: var(--red); }
+    .btn.soft:active { background: #f6dada; }
 
     .card { background: var(--card); border-radius: var(--radius); padding: 18px; margin-bottom: 16px;
             box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(20,30,60,.06); }
@@ -60,6 +64,10 @@
     .shopurl { color: var(--blue); font-weight: 600; word-break: break-all; }
     .pill { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 20px;
             background: #e3f0ff; color: #1565c0; }
+    .pill.on { background: #e3f7ec; color: #157a3a; }
+    .pill.off { background: #f0f0f2; color: #6e6e73; }
+    .actions { white-space: nowrap; }
+    .actions .btn { margin-left: 6px; }
     .muted { color: var(--sub); text-align: center; padding: 18px 0; }
     code { background: #ececf0; padding: 2px 6px; border-radius: 6px; font-size: 13px; }
   </style>
@@ -113,7 +121,7 @@
         <div class="card">
           <p class="label">All shops ({{ shops.length }})</p>
           <table>
-            <thead><tr><th>Shop</th><th>Owner</th><th>Bookings</th><th>Booking link</th><th>QR</th></tr></thead>
+            <thead><tr><th>Shop</th><th>Owner</th><th>Bookings</th><th>Booking link</th><th>QR</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody>
               <tr v-for="s in shops" :key="s.id">
                 <td><b>{{ s.name }}</b><br><span class="pill">/book/{{ s.slug }}</span></td>
@@ -121,8 +129,15 @@
                 <td>{{ s.bookings_count }}</td>
                 <td><a class="shopurl" :href="s.booking_url" target="_blank">{{ s.booking_url }}</a></td>
                 <td><a :href="s.qr_url" target="_blank"><img class="qr" :src="s.qr_url" :alt="s.slug+' qr'"></a></td>
+                <td><span class="pill" :class="s.active === 0 ? 'off' : 'on'">{{ s.active === 0 ? 'Inactive' : 'Active' }}</span></td>
+                <td class="actions">
+                  <button class="btn sm ghost" @click="toggleShop(s)">
+                    {{ s.active === 0 ? '启用' : '停用' }}
+                  </button>
+                  <button class="btn sm soft" @click="deleteShop(s)">删除</button>
+                </td>
               </tr>
-              <tr v-if="shops.length===0"><td colspan="5" class="muted">No shops yet.</td></tr>
+              <tr v-if="shops.length===0"><td colspan="7" class="muted">No shops yet.</td></tr>
             </tbody>
           </table>
         </div>
@@ -186,9 +201,27 @@
           } catch (e) { createErr.value = '网络错误，请重试'; }
           finally { creating.value = false; }
         }
+        async function setShopActive(s, active) {
+          const r = await fetch(`/api/super-admin/shops/${s.id}/${active ? 'activate' : 'deactivate'}`, {
+            method: 'POST', headers: auth().headers
+          });
+          if (r.status === 401) return logout();
+          if (r.ok) { loadShops(); }
+          else alert((await r.json()).detail || '操作失败');
+        }
+        function toggleShop(s) { setShopActive(s, s.active === 0); }
+        async function deleteShop(s) {
+          if (!confirm(`彻底删除店铺「${s.name}」？\n它的所有预约、服务、老板账号、关店日数据都会被永久删除，无法恢复！`)) return;
+          const r = await fetch(`/api/super-admin/shops/${s.id}`, {
+            method: 'DELETE', headers: auth().headers
+          });
+          if (r.status === 401) return logout();
+          if (r.ok) { loadShops(); }
+          else alert((await r.json()).detail || '删除失败');
+        }
         onMounted(() => { if (token.value) loadShops(); });
         return { token, password, loginErr, form, creating, createErr, created, shops,
-                 login, logout, loadShops, createShop };
+                 login, logout, loadShops, createShop, toggleShop, deleteShop };
       }
     }).mount('#app');
   </script>

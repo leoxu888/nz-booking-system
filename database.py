@@ -353,6 +353,8 @@ def init_db():
         _add_column(conn, "bookings", "customer_email", "TEXT")
         _add_column(conn, "shops", "daily_capacity", "INTEGER")
         _add_column(conn, "bookings", "manage_token", "TEXT")
+        # 店铺启用状态：0=停用（顾客端不可访问），1=启用；默认启用
+        _add_column(conn, "shops", "active", "INTEGER DEFAULT 1")
         # 关键约束：同一小店同一 UTC 时段只允许一条「有效」预约，从数据库层杜绝重复售卖。
         # 用「部分唯一索引」只覆盖有效状态(pending/confirmed)；取消/完成/失约的时段
         # 视为已释放，可重新预约（与 _slot_free / occupied_intervals 的逻辑一致）。
