@@ -1,0 +1,24 @@
+# Render 部署配置（基础设施即代码）。
+# 用法：在 render.com 新建 Blueprint / 导入此仓库时会读取。
+# sync:false 的变量需在 Render 控制台手动填入（不要写进 git）。
+services:
+  - type: web
+    name: nz-booking-system
+    runtime: python
+    plan: free
+    region: oregon      # 离新西兰近可选 oregon/singapore
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/book/demo/shop
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: SUPER_ADMIN_PASSWORD
+        sync: false
+      - key: SHOP_EMAIL
+        sync: false
+      - key: SHOP_TZ
+        value: Pacific/Auckland

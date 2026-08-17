@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Shop dashboard</title>
+  <script src="/vendor/vue.global.prod.js"></script>
+  <style>
+    :root {
+      --blue: #0071e3; --ink: #1d1d1f; --sub: #6e6e73; --bg: #f5f5f7;
+      --card: #fff; --line: #e6e6ea;
+      --amber: #b26a00; --blue2: #1565c0; --green: #1faa59; --red: #d23b3b;
+      --radius: 16px;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+             "Helvetica Neue", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: var(--bg); color: var(--ink); }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 22px 16px 56px; }
+
+    .topbar { display: flex; align-items: center; justify-content: space-between;
+              margin-bottom: 18px; }
+    .topbar h1 { font-size: 22px; letter-spacing: -.01em; margin: 0; }
+    .topbar .sub { color: var(--sub); font-size: 13px; }
+    .btn { border: none; background: var(--blue); color: #fff; font-size: 15px;
+           font-weight: 600; padding: 11px 18px; border-radius: 12px; cursor: pointer;
+           transition: transform .12s ease, background .2s, opacity .2s; }
+    .btn:active { transform: scale(.97); background: #005bbd; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn.ghost { background: #ececf0; color: var(--ink); }
+    .btn.ghost:active { background: #e0e0e5; }
+    .btn.sm { padding: 7px 12px; font-size: 13px; border-radius: 10px; }
+    .btn.danger { background: var(--red); }
+    .btn.danger:active { background: #b03030; }
+
+    .card { background: var(--card); border-radius: var(--radius); padding: 16px;
+            margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.04),
+            0 8px 24px rgba(20,30,60,.06); }
+
+    /* Login */
+    .login { max-width: 380px; margin: 12vh auto 0; }
+    .login h1 { text-align: center; font-size: 24px; margin-bottom: 4px; }
+    .login .sub { text-align: center; color: var(--sub); margin-bottom: 16px; }
+    input { width: 100%; padding: 14px; font-size: 16px; border: 1.5px solid var(--line);
+            border-radius: 12px; margin: 6px 0; background: #fbfbfd;
+            transition: border-color .2s; }
+    input:focus { outline: none; border-color: var(--blue); }
+    .err { color: var(--red); font-size: 13px; margin-top: 4px; }
+
+    .label { font-size: 13px; font-weight: 600; color: var(--sub);
+             text-transform: uppercase; letter-spacing: .04em; margin: 0 0 12px; }
+    .hint { color: var(--sub); font-size: 13px; line-height: 1.5; margin: 0 0 10px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 10px 6px; border-bottom: 1px solid #f0f0f3; }
+    th { color: var(--sub); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .winrow { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+    .winrow input { margin: 0; padding: 6px; width: auto; flex: 1; min-width: 0; }
+    .winrow .rm { flex: 0 0 auto; border: none; background: #fdeaea; color: var(--red);
+                  border-radius: 8px; width: 30px; height: 30px; font-size: 16px; cursor: pointer; }
+    .addwin { font-size: 13px; color: var(--blue); background: none; border: none;
+              cursor: pointer; padding: 4px 0; font-weight: 600; }
+    .closed-cell { text-align: center; }
+    .closed-cell input { width: auto; margin: 0; }
+
+    .bk { padding: 12px 4px; border-bottom: 1px solid #f0f0f3; }
+    .bk:last-child { border-bottom: none; }
+    .bk .head { display: flex; align-items: center; gap: 12px; }
+    .bk .time { font-size: 18px; font-weight: 700; width: 64px; flex: 0 0 auto; letter-spacing: -.01em; }
+    .bk .info { flex: 1; min-width: 0; }
+    .bk .info .svc { font-weight: 600; }
+    .bk .info .ph { color: var(--sub); font-size: 13px; }
+    .tag { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 20px; white-space: nowrap; }
+    .pending { background: #fff3e0; color: var(--amber); }
+    .confirmed { background: #e3f0ff; color: var(--blue2); }
+    .done { background: #e7f7ee; color: var(--green); }
+    .no_show { background: #fdeaea; color: var(--red); }
+    .cancelled { background: #efefef; color: #8a8a8e; }
+    .acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+    .statusbtn { border: 1.5px solid var(--line); background: #fff; color: var(--sub);
+                 font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 20px;
+                 cursor: pointer; transition: all .15s; }
+    .statusbtn.on { border-color: var(--blue); background: #eff5ff; color: var(--blue); }
+    .muted { color: var(--sub); text-align: center; padding: 18px 0; }
+
+    .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+    .filters input { margin: 0; flex: 1; min-width: 120px; }
+    .filters .q { flex: 2; min-width: 140px; }
+
+    .resched { background: #f7f9ff; border: 1px solid var(--line); border-radius: 12px;
+               padding: 10px 12px; margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .resched input { margin: 0; width: auto; flex: 1; min-width: 110px; }
+
+    .svcform { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .svcform input { margin: 0; flex: 1; min-width: 110px; }
+    .svcform .num { max-width: 92px; }
+
+    .note { color: var(--sub); font-size: 13px; line-height: 1.5; }
+    .note a { color: var(--blue); text-decoration: none; font-weight: 600; }
+    .qr { text-align: center; }
+    .qr img { width: 160px; height: 160px; border-radius: 12px; border: 1px solid var(--line); }
+    .qr .url { font-size: 13px; word-break: break-all; color: var(--blue); margin-top: 8px; }
+
+    textarea { width: 100%; padding: 12px; font-size: 15px; border: 1.5px solid var(--line);
+               border-radius: 12px; background: #fbfbfd; resize: vertical;
+               font-family: inherit; transition: border-color .2s; }
+    textarea:focus { outline: none; border-color: var(--blue); }
+    .airow { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+    .aistatus { font-size: 14px; font-weight: 600; }
+    .ok { color: var(--green); }
+    .bad { color: var(--red); }
+    .airest { margin-top: 12px; background: #f0f7ff; border-radius: 12px; padding: 12px 14px;
+              font-size: 14px; line-height: 1.7; }
+    .airest .k { color: var(--sub); }
+    .airest .v { font-weight: 600; color: var(--ink); }
+    .blk { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+    .blk .d { font-weight: 600; }
+    .blk .n { color: var(--sub); font-size: 13px; flex: 1; }
+    .blk .x { border: none; background: #fdeaea; color: var(--red); border-radius: 8px;
+              width: 28px; height: 28px; cursor: pointer; }
+    .fade-enter-active, .fade-leave-active { transition: opacity .25s ease; }
+    .fade-enter-from, .fade-leave-to { opacity: 0; }
+    @media (prefers-reduced-motion: reduce) {
+      .btn, .statusbtn { transition: none; }
+      .fade-enter-active, .fade-leave-active { transition: opacity .15s ease; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="wrap">
+    <transition name="fade" mode="out-in">
+      <!-- LOGIN -->
+      <div v-if="!token" class="card login" key="login">
+        <h1>{{ shop.name || 'Shop dashboard' }}</h1>
+        <div class="sub">Owner sign-in</div>
+        <input type="text" v-model="username" placeholder="Username" @keyup.enter="login" />
+        <input type="password" v-model="password" placeholder="Password"
+               @keyup.enter="login" />
+        <div class="err" v-if="loginErr">{{ loginErr }}</div>
+        <button class="btn" style="width:100%;margin-top:8px" @click="login">Sign in</button>
+        <div class="note" style="margin-top:14px;text-align:center">
+          平台超级管理员？去 <a href="/super-admin.html">/super-admin.html</a>
+        </div>
+      </div>
+
+      <!-- DASHBOARD -->
+      <div v-else key="dash">
+        <div class="topbar">
+          <div>
+            <h1>{{ shop.name || 'Dashboard' }}</h1>
+            <div class="sub">Bookings &amp; services</div>
+          </div>
+          <button class="btn ghost sm" @click="logout">Sign out</button>
+        </div>
+
+        <!-- Shop booking link + QR -->
+        <div class="card qr" v-if="shop.booking_url">
+          <p class="label">Your booking page</p>
+          <img :src="shop.qr_url" alt="booking QR" />
+          <div class="url">{{ shop.booking_url }}</div>
+          <a class="note" :href="shop.qr_url" target="_blank">Open full-size QR</a>
+        </div>
+
+        <!-- Business hours (per-weekday, multiple windows) -->
+        <div class="card">
+          <p class="label">Available hours</p>
+          <p class="hint">Set when customers can book. Add multiple windows (e.g. morning + afternoon with a lunch break). Tick "Closed" for a day off.</p>
+          <table>
+            <thead><tr><th>Day</th><th>Time windows</th><th>Closed</th></tr></thead>
+            <tbody>
+              <tr v-for="(d, idx) in weekdayKeys" :key="idx">
+                <td style="vertical-align:top;padding-top:14px">{{ weekdayNames[idx] }}</td>
+                <td>
+                  <template v-if="!hours[d].closed">
+                    <div class="winrow" v-for="(w, wi) in hours[d].windows" :key="wi">
+                      <input type="time" v-model="w.open" />
+                      <span style="color:var(--sub)">–</span>
+                      <input type="time" v-model="w.close" />
+                      <button class="rm" @click="removeWindow(d, wi)">×</button>
+                    </div>
+                    <button class="addwin" @click="addWindow(d)">+ add window</button>
+                  </template>
+                  <span v-else class="hint" style="margin:0">Closed all day</span>
+                </td>
+                <td class="closed-cell"><input type="checkbox" v-model="hours[d].closed" style="width:auto;margin:0" /></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="svcform" style="margin-top:12px">
+            <span class="hint" style="margin:0">Slot length</span>
+            <input v-model.number="slotMinutes" type="number" class="num" style="max-width:90px" />
+            <span class="hint" style="margin:0">min</span>
+            <span class="hint" style="margin:0">Daily limit</span>
+            <input v-model.number="dailyCapacity" type="number" class="num" style="max-width:90px" min="0" />
+            <span class="hint" style="margin:0">(0 = no limit)</span>
+            <button class="btn sm" :disabled="savingHours" @click="saveHours">
+              {{ savingHours ? 'Saving…' : 'Save hours' }}
+            </button>
+            <span v-if="hoursMsg" class="aistatus" :class="hoursOk ? 'ok' : 'bad'">{{ hoursMsg }}</span>
+          </div>
+        </div>
+
+        <!-- Blackout dates (specific day off / holiday) -->
+        <div class="card">
+          <p class="label">Blackout dates (days off / holidays)</p>
+          <p class="hint">Block specific dates from being booked — handy for public holidays or your own time off.</p>
+          <div class="blk" v-for="b in blackouts" :key="b.date">
+            <span class="d">{{ b.date }}</span>
+            <span class="n">{{ b.note || '' }}</span>
+            <button class="x" @click="removeBlackout(b.date)">×</button>
+          </div>
+          <div v-if="blackouts.length===0" class="hint">No blackout dates set.</div>
+          <div class="svcform" style="margin-top:12px">
+            <input type="date" v-model="newBlackout" />
+            <input v-model="newBlackoutNote" placeholder="note (optional)" style="flex:2" />
+            <button class="btn sm" :disabled="!newBlackout" @click="addBlackout">Add</button>
+          </div>
+        </div>
+
+        <!-- iCal export + subscribe -->
+        <div class="card">
+          <p class="label">Calendar (iCal / .ics)</p>
+          <p class="hint">Export your schedule, or subscribe so Google / Apple / Outlook stays in sync automatically (refreshes hourly).</p>
+          <button class="btn sm" :disabled="exporting" @click="exportIcs">
+            {{ exporting ? 'Preparing…' : '⬇ Download .ics' }}
+          </button>
+          <button class="btn ghost sm" :disabled="exportingCsv" @click="exportCsv" style="margin-left:8px">
+            {{ exportingCsv ? 'Preparing…' : '⬇ Export CSV' }}
+          </button>
+          <div style="margin-top:12px">
+            <div class="hint" style="margin-bottom:4px">Subscription link (private to you):</div>
+            <div class="url" style="word-break:break-all;color:var(--blue)">{{ shop.calendar_url }}</div>
+            <button class="btn ghost sm" style="margin-top:8px" @click="copyCal">Copy link</button>
+            <span v-if="copied" class="aistatus ok" style="margin-left:8px">Copied!</span>
+          </div>
+        </div>
+
+        <!-- AI quick booking -->
+        <div class="card">
+          <p class="label">✨ AI 一键记账 / 排班</p>
+          <textarea v-model="aiText" rows="3"
+            placeholder="粘贴短信或笔记，例如：Kia ora, Tom tomorrow 3pm haircut $30 txt 0211234567"></textarea>
+          <div class="airow">
+            <button class="btn" :disabled="aiLoading || !aiText.trim()" @click="aiParse">
+              {{ aiLoading ? 'AI 思考中…' : 'AI 解析并保存' }}
+            </button>
+            <span v-if="aiMsg" class="aistatus" :class="aiOk ? 'ok' : 'bad'">{{ aiMsg }}</span>
+          </div>
+          <div v-if="aiResult" class="airest">
+            <div><span class="k">顾客：</span><span class="v">{{ aiResult.customer_name || '—' }}</span></div>
+            <div><span class="k">手机：</span><span class="v">{{ aiResult.phone_number || '—' }}</span></div>
+            <div><span class="k">服务：</span><span class="v">{{ aiResult.service_name }}</span>
+              <span v-if="aiResult.service_created" class="aistatus ok">（已新建服务）</span></div>
+            <div><span class="k">价格：</span><span class="v">{{ aiResult.price != null ? '$'+aiResult.price : '—' }}</span></div>
+            <div><span class="k">时间：</span><span class="v">{{ fmtLocal(aiResult.booking_time_local) }}</span></div>
+            <div class="aistatus ok" style="margin-top:6px">已成功自动入库！</div>
+          </div>
+        </div>
+
+        <!-- Reports (simple, free) -->
+        <div class="card" v-if="stats">
+          <p class="label">Reports</p>
+          <div class="filters">
+            <div class="blk" style="margin:0"><span class="d">Total bookings</span><span class="v" style="font-weight:700">{{ stats.total }}</span></div>
+            <div class="blk" style="margin:0"><span class="d">This week</span><span class="v" style="font-weight:700">{{ stats.week_bookings }}</span></div>
+            <div class="blk" style="margin:0"><span class="d">No-show rate</span><span class="v" style="font-weight:700;color:var(--red)">{{ stats.no_show_rate }}%</span></div>
+          </div>
+        </div>
+
+        <!-- Schedule (filters + status actions) -->
+        <div class="card">
+          <p class="label">Schedule</p>
+          <div class="filters">
+            <input type="date" v-model="fromDate" @change="loadBookings" />
+            <span class="hint" style="margin:0">to</span>
+            <input type="date" v-model="toDate" @change="loadBookings" />
+            <input class="q" type="text" v-model="searchQ" placeholder="Search name / email"
+                   @input="loadBookings" />
+            <button class="btn ghost sm" @click="setToday">Today</button>
+          </div>
+          <div v-if="bookings.length===0" class="muted">No bookings in this range.</div>
+          <div v-for="b in bookings" :key="b.id" class="bk">
+            <div class="head">
+              <div class="time">{{ b.time }}</div>
+              <div class="info">
+                <div class="svc">{{ b.service }}</div>
+                <div class="ph">{{ b.date }} · {{ b.name || '—' }} · {{ b.email || maskPhone(b.phone) }}</div>
+                <div class="ph" v-if="b.returning" style="color:var(--blue2);font-weight:600">📌 {{ b.visits }}th visit<span v-if="b.last_service"> · last: {{ b.last_service }}</span></div>
+              </div>
+              <span class="tag" :class="b.status">{{ label(b.status) }}</span>
+            </div>
+            <div class="acts">
+              <button class="statusbtn" v-for="st in statuses" :key="st"
+                      :class="{on: b.status===st}" @click="setStatus(b.id, st)">{{ label(st) }}</button>
+              <button class="btn sm" @click="openResched(b)">Reschedule</button>
+              <button class="btn sm danger" @click="cancelBooking(b.id)">Cancel &amp; Notify</button>
+            </div>
+            <div class="resched" v-if="reschedId===b.id">
+              <input type="date" v-model="reschedDate" />
+              <input type="time" v-model="reschedTime" />
+              <button class="btn sm" :disabled="!reschedDate || !reschedTime" @click="saveResched(b)">Save</button>
+              <button class="btn ghost sm" @click="reschedId=null">Cancel</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Service management -->
+        <div class="card">
+          <p class="label">Services</p>
+          <div class="svcform">
+            <input v-model="newSvc.name" placeholder="Service name" />
+            <input v-model.number="newSvc.duration_min" type="number" class="num" placeholder="Min" />
+            <input v-model.number="newSvc.price" type="number" class="num" placeholder="$" />
+            <button class="btn sm" @click="addService">Add</button>
+          </div>
+          <table>
+            <thead><tr><th>Service</th><th>Duration</th><th>Price</th><th></th></tr></thead>
+            <tbody>
+              <tr v-for="s in services" :key="s.id">
+                <td>{{ s.name }}</td>
+                <td>{{ s.duration_min }} min</td>
+                <td>${{ s.price }}</td>
+                <td style="text-align:right"><button class="btn ghost sm" @click="delService(s.id)">Delete</button></td>
+              </tr>
+              <tr v-if="services.length===0"><td colspan="4" class="muted">No services yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </transition>
+  </div>
+
+  <script>
+    const { createApp, ref, computed, onMounted } = Vue;
+    const TOKEN_KEY = 'booking_owner_token';
+
+    function localDateStr(d) {
+      const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'),
+            day = String(d.getDate()).padStart(2,'0');
+      return `${y}-${m}-${day}`;
+    }
+
+    createApp({
+      setup() {
+        const token = ref(localStorage.getItem(TOKEN_KEY) || '');
+        const shop = ref({ name: '' });
+        const username = ref('');
+        const password = ref('');
+        const loginErr = ref('');
+        const bookings = ref([]);
+        const services = ref([]);
+        const newSvc = ref({ name: '', duration_min: 30, price: 0 });
+        const aiText = ref('');
+        const aiLoading = ref(false);
+        const aiMsg = ref('');
+        const aiOk = ref(false);
+        const aiResult = ref(null);
+        const weekdayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+        const weekdayKeys = ['0', '1', '2', '3', '4', '5', '6'];
+        const hours = ref({});
+        const slotMinutes = ref(30);
+        const dailyCapacity = ref(0);
+        const savingHours = ref(false);
+        const hoursMsg = ref('');
+        const hoursOk = ref(false);
+        const blackouts = ref([]);
+        const newBlackout = ref('');
+        const newBlackoutNote = ref('');
+        const exporting = ref(false);
+        const exportingCsv = ref(false);
+        const stats = ref(null);
+        const copied = ref(false);
+        const statuses = ['pending', 'confirmed', 'done', 'no_show', 'cancelled'];
+        const fromDate = ref(localDateStr(new Date()));
+        const toDate = ref(localDateStr(new Date()));
+        const searchQ = ref('');
+        const reschedId = ref(null);
+        const reschedDate = ref('');
+        const reschedTime = ref('');
+
+        function auth() { return { headers: { 'Authorization': 'Bearer ' + token.value } }; }
+
+        async function loadShop() {
+          try {
+            const d = await (await fetch('/api/admin/shop', auth())).json();
+            shop.value = d;
+            slotMinutes.value = d.slot_minutes || 30;
+            dailyCapacity.value = d.daily_capacity || 0;
+            initHours(d.opening_hours);
+            blackouts.value = d.blackout_dates || [];
+          } catch (e) {}
+        }
+        function initHours(jsonStr) {
+          let data = {};
+          try { data = JSON.parse(jsonStr || '{}'); } catch (e) { data = {}; }
+          const h = {};
+          for (let i = 0; i < 7; i++) {
+            const e = data[String(i)];
+            if (!e) { h[String(i)] = { closed: true, windows: [] }; continue; }
+            let wins = [];
+            if (Array.isArray(e) && e.length && Array.isArray(e[0])) {
+              wins = e.map(w => ({ open: w[0], close: w[1] }));
+            } else if (Array.isArray(e) && e.length === 2 && typeof e[0] === 'string') {
+              wins = [{ open: e[0], close: e[1] }];
+            }
+            h[String(i)] = { closed: wins.length === 0, windows: wins };
+          }
+          hours.value = h;
+        }
+        function addWindow(d) { hours.value[d].windows.push({ open: '09:00', close: '17:00' }); }
+        function removeWindow(d, wi) { hours.value[d].windows.splice(wi, 1); }
+        async function saveHours() {
+          savingHours.value = true; hoursMsg.value = '';
+          const data = {};
+          for (let i = 0; i < 7; i++) {
+            const h = hours.value[String(i)];
+            data[String(i)] = h.closed ? null : h.windows.map(w => [w.open, w.close]);
+          }
+          try {
+            const r = await fetch('/api/admin/shop', {
+              method: 'PATCH',
+              headers: { ...auth().headers, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ opening_hours: JSON.stringify(data), slot_minutes: slotMinutes.value, daily_capacity: dailyCapacity.value }),
+            });
+            hoursOk.value = r.ok;
+            hoursMsg.value = r.ok ? 'Hours saved ✓' : 'Save failed';
+          } catch (e) {
+            hoursOk.value = false; hoursMsg.value = 'Network error';
+          } finally {
+            savingHours.value = false;
+            setTimeout(() => (hoursMsg.value = ''), 3000);
+          }
+        }
+        async function addBlackout() {
+          if (!newBlackout.value) return;
+          await fetch('/api/admin/blackout', {
+            method: 'POST',
+            headers: { ...auth().headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: newBlackout.value, note: newBlackoutNote.value || null }),
+          });
+          newBlackout.value = ''; newBlackoutNote.value = '';
+          await loadBlackout();
+        }
+        async function removeBlackout(date) {
+          await fetch('/api/admin/blackout/' + date, { method: 'DELETE', ...auth() });
+          await loadBlackout();
+        }
+        async function loadBlackout() {
+          try {
+            const d = await (await fetch('/api/admin/blackout', auth())).json();
+            blackouts.value = d.dates || [];
+          } catch (e) {}
+        }
+        async function exportIcs() {
+          exporting.value = true;
+          try {
+            const r = await fetch('/api/admin/export-ics', auth());
+            if (r.ok) {
+              const blob = await r.blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url; a.download = 'schedule.ics'; a.click();
+              URL.revokeObjectURL(url);
+            }
+          } catch (e) {}
+          finally { exporting.value = false; }
+        }
+        async function copyCal() {
+          try {
+            await navigator.clipboard.writeText(shop.value.calendar_url);
+            copied.value = true; setTimeout(() => (copied.value = false), 2000);
+          } catch (e) {}
+        }
+        async function exportCsv() {
+          exportingCsv.value = true;
+          try {
+            // 导出全部预约（不继承排班筛选的「仅今天」范围，避免误只导出当天）
+            const r = await fetch('/api/admin/export-csv', auth());
+            if (r.ok) {
+              const blob = await r.blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url; a.download = 'bookings.csv'; a.click();
+              URL.revokeObjectURL(url);
+            }
+          } catch (e) {}
+          finally { exportingCsv.value = false; }
+        }
+        async function loadStats() {
+          try {
+            const d = await (await fetch('/api/admin/stats', auth())).json();
+            stats.value = d;
+          } catch (e) {}
+        }
+        async function login() {
+          const r = await fetch('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username.value, password: password.value })
+          });
+          if (r.ok) { const d = await r.json(); token.value = d.token;
+            localStorage.setItem(TOKEN_KEY, d.token); loginErr.value=''; loadAll(); }
+          else loginErr.value = 'Wrong username or password.';
+        }
+        function logout() { token.value=''; localStorage.removeItem(TOKEN_KEY); }
+        async function loadBookings() {
+          const qs = new URLSearchParams({
+            from_date: fromDate.value || '', to_date: toDate.value || '', q: searchQ.value || ''
+          }).toString();
+          const r = await fetch('/api/admin/bookings?' + qs, auth());
+          if (r.status === 401) return logout();
+          bookings.value = await r.json();
+        }
+        async function loadServices() {
+          const r = await fetch('/api/admin/services', auth());
+          if (r.status === 401) return logout();
+          services.value = await r.json();
+        }
+        function loadAll() { loadShop(); loadBookings(); loadServices(); loadStats(); }
+        function setToday() {
+          fromDate.value = localDateStr(new Date());
+          toDate.value = localDateStr(new Date());
+          loadBookings();
+        }
+        async function setStatus(id, st) {
+          await fetch('/api/admin/bookings/' + id, {
+            method: 'PATCH',
+            headers: { ...auth().headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: st }) });
+          loadBookings();
+        }
+        function openResched(b) {
+          reschedId.value = b.id;
+          reschedDate.value = b.date;
+          reschedTime.value = b.time;
+        }
+        async function saveResched(b) {
+          const start_local = reschedDate.value + 'T' + reschedTime.value;
+          await fetch('/api/admin/bookings/' + b.id, {
+            method: 'PATCH',
+            headers: { ...auth().headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ start_local }) });
+          reschedId.value = null;
+          loadBookings();
+        }
+        async function cancelBooking(id) {
+          if (!confirm('Cancel this booking and notify the customer?')) return;
+          await fetch('/api/admin/bookings/' + id, {
+            method: 'PATCH',
+            headers: { ...auth().headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'cancelled' }) });
+          loadBookings();
+        }
+        async function addService() {
+          if (!newSvc.value.name) return;
+          await fetch('/api/admin/services', {
+            method: 'POST',
+            headers: { ...auth().headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify(newSvc.value) });
+          newSvc.value = { name:'', duration_min:30, price:0 };
+          loadServices();
+        }
+        async function delService(id) {
+          if (!confirm('Delete this service?')) return;
+          await fetch('/api/admin/services/' + id, { method: 'DELETE', ...auth() });
+          loadServices();
+        }
+        function maskPhone(p) {
+          if (!p) return '';
+          const d = p.replace(/[^\d]/g, '');
+          const last4 = d.slice(-4);
+          return '+64 •••• ' + last4;
+        }
+        function label(s) {
+          return { pending:'Pending', confirmed:'Confirmed', done:'Done',
+                   no_show:'No-show', cancelled:'Cancelled' }[s] || s;
+        }
+        function fmtLocal(iso) {
+          if (!iso) return '—';
+          const d = new Date(iso);
+          if (isNaN(d)) return iso;
+          return d.toLocaleString('en-NZ', { weekday:'short', day:'numeric', month:'short',
+            hour:'2-digit', minute:'2-digit' });
+        }
+        async function aiParse() {
+          if (!aiText.value.trim()) return;
+          aiLoading.value = true; aiMsg.value = ''; aiResult.value = null;
+          try {
+            const r = await fetch('/api/admin/ai-parse-booking', {
+              method: 'POST',
+              headers: { ...auth().headers, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ raw_text: aiText.value })
+            });
+            const d = await r.json();
+            if (r.ok) {
+              aiResult.value = d;
+              aiOk.value = true;
+              aiMsg.value = '已成功自动入库！';
+              aiText.value = '';
+              loadBookings();
+            } else {
+              aiOk.value = false;
+              aiMsg.value = d.detail || '解析失败';
+            }
+          } catch (e) {
+            aiOk.value = false;
+            aiMsg.value = '网络错误，请重试';
+          } finally {
+            aiLoading.value = false;
+          }
+        }
+        onMounted(() => { if (token.value) loadAll(); });
+        return { token, shop, username, password, loginErr, bookings, services, newSvc,
+                 login, logout, setToday, setStatus, openResched, saveResched, cancelBooking,
+                 addService, delService, maskPhone, label, fmtLocal,
+                 aiText, aiLoading, aiMsg, aiOk, aiResult, aiParse,
+                 weekdayNames, weekdayKeys, hours, slotMinutes, savingHours, hoursMsg,
+                 hoursOk, addWindow, removeWindow, saveHours, dailyCapacity,
+                 blackouts, newBlackout, newBlackoutNote, addBlackout, removeBlackout,
+                 exporting, exportingCsv, exportCsv, copied, exportIcs, copyCal, stats,
+                 statuses, fromDate, toDate, searchQ };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# 本地数据库（部署后用 Postgres，不进 git）
+booking.db
+booking.db-wal
+booking.db-shm
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# 系统
+.DS_Store

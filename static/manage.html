@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Manage your booking</title>
+  <script src="/vendor/vue.global.prod.js"></script>
+  <style>
+    :root {
+      --blue: #0071e3; --blue-press: #005bbd;
+      --ink: #1d1d1f; --sub: #6e6e73; --bg: #f5f5f7;
+      --card: #ffffff; --line: #e6e6ea; --green: #1faa59; --red: #d23b3b;
+      --radius: 18px;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+             "Helvetica Neue", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: var(--bg); color: var(--ink); }
+    .wrap { max-width: 480px; margin: 0 auto; padding: 28px 18px 56px; }
+    .hero { text-align: center; margin-bottom: 22px; }
+    .hero h1 { font-size: 28px; line-height: 1.1; letter-spacing: -.02em; margin: 0 0 6px; font-weight: 700; }
+    .hero p { color: var(--sub); margin: 0; font-size: 15px; }
+    .card { background: var(--card); border-radius: var(--radius); padding: 18px;
+            margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(20,30,60,.06); }
+    .label { font-size: 13px; font-weight: 600; color: var(--sub); text-transform: uppercase; letter-spacing: .04em; margin: 0 0 10px; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); }
+    .row:last-child { border-bottom: none; }
+    .row .k { color: var(--sub); font-size: 15px; }
+    .row .v { font-weight: 600; text-align: right; }
+    .tag { display: inline-block; font-size: 13px; font-weight: 700; padding: 4px 12px; border-radius: 999px; }
+    .tag.pending { background: #fff3d6; color: #9a6b00; }
+    .tag.confirmed { background: #e1f0ff; color: #005bbd; }
+    .tag.done { background: #e3f6ec; color: #1faa59; }
+    .tag.no_show { background: #fde2e2; color: #c0392b; }
+    .tag.cancelled { background: #efeff2; color: #8a8a8f; }
+    .btn { display: block; width: 100%; border: none; background: var(--blue); color: #fff;
+           font-size: 17px; font-weight: 600; padding: 16px; border-radius: 14px; margin-top: 14px;
+           cursor: pointer; transition: transform .12s ease, background .2s, opacity .2s; }
+    .btn:active { transform: scale(.98); background: var(--blue-press); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn.ghost { background: #ececf0; color: var(--ink); }
+    .btn.ghost:active { background: #e0e0e5; }
+    .btn.danger { background: var(--red); }
+    .btn.danger:active { background: #b22f2f; }
+    .cal { display: block; width: 100%; text-align: center; text-decoration: none;
+           border: 1.5px solid var(--line); color: var(--ink); font-weight: 600;
+           padding: 13px; border-radius: 14px; margin-top: 10px; background: #fff;
+           transition: border-color .2s, background .2s; }
+    .cal:active { background: #f0f0f3; }
+    .err { color: var(--red); font-size: 14px; margin-top: 10px; }
+    .okmsg { color: var(--green); font-size: 15px; margin-top: 10px; font-weight: 600; }
+    .empty { color: var(--sub); text-align: center; padding: 18px 0; font-size: 15px; }
+    .daterow { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+    .navbtn { width: 42px; height: 42px; flex: 0 0 auto; border-radius: 50%; border: 1.5px solid var(--line);
+              background: #fff; font-size: 20px; cursor: pointer; transition: transform .12s ease, background .2s; }
+    .navbtn:active { transform: scale(.92); }
+    .datepill { flex: 1; text-align: center; }
+    .datepill .d1 { font-size: 18px; font-weight: 600; }
+    .datepill .d2 { font-size: 13px; color: var(--sub); }
+    .slots { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }
+    .slot { border: 1.5px solid var(--line); background: #fff; border-radius: 12px; padding: 13px 0;
+            text-align: center; font-size: 16px; font-weight: 600; cursor: pointer;
+            transition: transform .12s ease, border-color .2s, background .2s; }
+    .slot:active { transform: scale(.95); }
+    .slot.sel { border-color: var(--blue); background: #eff5ff; color: var(--blue); }
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center;
+             justify-content: center; padding: 22px; z-index: 50; }
+    .modal .box { background: #fff; border-radius: 18px; padding: 22px; max-width: 360px; width: 100%; }
+    .modal h3 { margin: 0 0 8px; font-size: 19px; }
+    .modal p { color: var(--sub); font-size: 15px; margin: 0 0 16px; }
+    .center { text-align: center; padding: 60px 0; color: var(--sub); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="wrap">
+      <div class="hero">
+        <h1>Manage your booking</h1>
+        <p v-if="b">{{ b.shop_name }}</p>
+      </div>
+
+      <div v-if="loading" class="card center">Loading…</div>
+
+      <div v-else-if="loadErr" class="card center">{{ loadErr }}</div>
+
+      <template v-else>
+        <!-- Cancelled banner -->
+        <div v-if="b.status === 'cancelled'" class="card">
+          <div class="row"><span class="k">Status</span><span class="v"><span class="tag cancelled">Cancelled</span></span></div>
+          <div class="row"><span class="k">Service</span><span class="v">{{ b.service }}</span></div>
+          <div class="row"><span class="k">When</span><span class="v">{{ pretty }}</span></div>
+          <p class="okmsg" style="margin-top:14px">This booking has been cancelled. Nothing else to do here.</p>
+        </div>
+
+        <!-- Active booking -->
+        <div v-else class="card">
+          <div class="label">Your appointment</div>
+          <div class="row"><span class="k">Service</span><span class="v">{{ b.service }}</span></div>
+          <div class="row"><span class="k">When</span><span class="v">{{ pretty }}</span></div>
+          <div class="row"><span class="k">Name</span><span class="v">{{ b.customer_name }}</span></div>
+          <div class="row"><span class="k">Status</span><span class="v"><span class="tag" :class="b.status">{{ label(b.status) }}</span></span></div>
+
+          <div class="label" style="margin-top:18px">Add to your calendar</div>
+          <a class="cal" :href="b.ics_url">⬇ Apple / Outlook (.ics)</a>
+          <a class="cal" :href="b.gcal_url" target="_blank">➕ Google Calendar</a>
+
+          <div class="okmsg" v-if="okMsg">{{ okMsg }}</div>
+          <div class="err" v-if="errMsg">{{ errMsg }}</div>
+
+          <!-- Reschedule UI -->
+          <template v-if="rescheduling">
+            <div class="label" style="margin-top:18px">Pick a new time</div>
+            <div class="daterow">
+              <button class="navbtn" @click="shift(-1)">‹</button>
+              <div class="datepill">
+                <div class="d1">{{ dayName }}</div>
+                <div class="d2">{{ dayDate }}</div>
+              </div>
+              <button class="navbtn" @click="shift(1)">›</button>
+            </div>
+            <div v-if="loadingSlots" class="empty">Loading times…</div>
+            <div v-else-if="slots.length === 0" class="empty">No available times on this day.</div>
+            <div v-else class="slots">
+              <div v-for="s in slots" :key="s.start_local" class="slot"
+                   :class="{ sel: sel === s.start_local, disabled: s.disabled }"
+                   @click="!s.disabled && (sel = s.start_local)">
+                {{ s.label }}
+              </div>
+            </div>
+            <button class="btn" :disabled="!sel || saving" @click="doReschedule">
+              {{ saving ? 'Saving…' : 'Confirm new time' }}
+            </button>
+            <button class="btn ghost" @click="rescheduling = false; errMsg=''; sel=''">Cancel</button>
+          </template>
+
+          <button v-else class="btn" @click="startReschedule">Reschedule</button>
+          <button v-else class="btn danger" @click="askCancel = true">Cancel booking</button>
+        </div>
+      </template>
+    </div>
+
+    <!-- Cancel confirmation modal -->
+    <div class="modal" v-if="askCancel">
+      <div class="box">
+        <h3>Cancel this booking?</h3>
+        <p>This will free up the slot and notify {{ b.shop_name }}. You can't undo this from here.</p>
+        <button class="btn danger" :disabled="saving" @click="doCancel">{{ saving ? 'Cancelling…' : 'Yes, cancel' }}</button>
+        <button class="btn ghost" @click="askCancel = false">Keep it</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, computed, onMounted } = Vue;
+    createApp({
+      setup() {
+        // Extract slug + token from /manage/{slug}/{token}
+        const parts = window.location.pathname.split('/').filter(Boolean);
+        const slug = parts[1] || '';
+        const token = parts[2] || '';
+        const base = '/api/book/' + slug + '/manage/' + token;
+
+        const loading = ref(true);
+        const loadErr = ref('');
+        const b = ref(null);
+        const okMsg = ref('');
+        const errMsg = ref('');
+
+        const rescheduling = ref(false);
+        const loadingSlots = ref(false);
+        const slots = ref([]);
+        const sel = ref('');
+        const saving = ref(false);
+
+        const askCancel = ref(false);
+
+        const pretty = computed(() => b.value ? new Date(b.value.start_local).toLocaleString('en-NZ', { weekday:'long', day:'numeric', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit' }) : '');
+        const dayName = computed(() => new Date(cur.value).toLocaleDateString('en-NZ', { weekday:'long' }));
+        const dayDate = computed(() => new Date(cur.value).toLocaleDateString('en-NZ', { day:'numeric', month:'short', year:'numeric' }));
+
+        const cur = ref(new Date());
+        const fmtDate = (d) => {
+          const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
+          return `${y}-${m}-${day}`;
+        };
+
+        function label(s) {
+          return ({ pending:'Pending', confirmed:'Confirmed', done:'Done', no_show:'No-show', cancelled:'Cancelled' })[s] || s;
+        }
+
+        async function load() {
+          try {
+            const r = await fetch(base);
+            if (!r.ok) { loadErr.value = 'This booking link is invalid or has expired.'; return; }
+            b.value = await r.json();
+          } catch (e) { loadErr.value = 'Network error — please try again.'; }
+          finally { loading.value = false; }
+        }
+
+        function startReschedule() {
+          errMsg.value = ''; okMsg.value = '';
+          rescheduling.value = true;
+          sel.value = '';
+          cur.value = new Date(b.value.start_local);
+          loadSlots();
+        }
+
+        async function loadSlots() {
+          loadingSlots.value = true;
+          try {
+            const r = await fetch(`/api/book/${slug}/availability?service_id=${b.value.service_id}&date=${fmtDate(cur.value)}`);
+            const now = Date.now();
+            slots.value = (r.ok ? await r.json() : []).map(s => ({
+              ...s, disabled: new Date(s.start_local).getTime() <= now
+            }));
+          } catch (e) { slots.value = []; }
+          finally { loadingSlots.value = false; }
+        }
+
+        function shift(n) {
+          const d = new Date(cur.value); d.setDate(d.getDate() + n); cur.value = d;
+          sel.value = ''; loadSlots();
+        }
+
+        async function doReschedule() {
+          if (!sel.value) return;
+          saving.value = true; errMsg.value = '';
+          try {
+            const r = await fetch(base + '/reschedule', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ service_id: b.value.service_id, start_local: sel.value,
+                                    customer_name: b.value.customer_name, customer_email: b.value.customer_email })
+            });
+            if (r.ok) { okMsg.value = 'Your booking time has been updated.'; rescheduling.value = false; await load(); }
+            else { const j = await r.json().catch(()=>({})); errMsg.value = j.detail || 'Could not reschedule — try another time.'; }
+          } catch (e) { errMsg.value = 'Network error — please try again.'; }
+          finally { saving.value = false; }
+        }
+
+        async function doCancel() {
+          saving.value = true; errMsg.value = '';
+          try {
+            const r = await fetch(base + '/cancel', { method: 'POST' });
+            if (r.ok) { okMsg.value = 'Your booking has been cancelled.'; askCancel.value = false; await load(); }
+            else { errMsg.value = 'Could not cancel — please contact the business.'; }
+          } catch (e) { errMsg.value = 'Network error — please try again.'; }
+          finally { saving.value = false; }
+        }
+
+        onMounted(load);
+        return { b, loading, loadErr, okMsg, errMsg, rescheduling, loadingSlots, slots, sel, saving,
+                 askCancel, pretty, dayName, dayDate, cur, label, startReschedule, shift,
+                 doReschedule, doCancel };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>

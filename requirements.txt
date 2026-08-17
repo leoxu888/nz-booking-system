@@ -1,0 +1,18 @@
+# 免费技术栈依赖（全部开源 / 免费）。版本已固定，保证可复现、避免意外破坏性升级。
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
+qrcode==8.0
+Pillow==11.0.0
+requests==2.32.3
+
+# 多租户认证：密码哈希 + JWT
+bcrypt==4.2.1
+PyJWT==2.10.1
+
+# 生产数据库（Postgres，100% 免费额度可用 Supabase/Neon）。本地开发不装也能跑（自动回退 SQLite）。
+psycopg2-binary==2.9.10
+
+# AI 智能解析（免费：Google Gemini Developer API，无需信用卡）。
+# 仅在设置了 GEMINI_API_KEY 后才会真正调用；未设置时后端自动用本地规则解析，照常可用。
+google-genai==1.7.0

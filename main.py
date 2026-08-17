@@ -1,0 +1,1606 @@
+"""
+轻量级 Web 预约系统 —— 多租户后端（FastAPI + SQLite）
+完全免费：框架开源、数据库零配置、邮件用自家 SMTP、日历为可选免费集成。
+
+多租户要点：
+- 每个小店 = 一条 shops 记录，拥有独立的 services / bookings。
+- 老板账号在 users 表里（role='shop_owner'），JWT 里带 shop_id，所有查询强制 WHERE shop_id=...
+- 超级管理员（平台方）用环境变量 SUPER_ADMIN_PASSWORD 登录，可创建小店与老板账号。
+
+启动： uvicorn main:app --reload  （默认 http://localhost:8000）
+"""
+import os
+import re
+import json
+import time
+import hmac
+import hashlib
+import base64
+import secrets
+# sqlite3 已由 database 层按需封装（含 Postgres 双模式），此处不再直接使用
+import threading
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
+
+import uvicorn
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+load_dotenv()  # 读取 .env（密钥、时区、邮件等）
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from database import (get_conn, init_db, SHOP_TZ, slugify,
+                     day_hours, DEFAULT_OPENING_HOURS,
+                     add_blackout, remove_blackout, list_blackouts,
+                     IntegrityError)
+from auth_utils import (hash_password, verify_password, create_token, decode_token,
+                        secure_compare, SECRET_KEY)
+from emailer import send_email
+from calendar_sync import push_event
+
+BASE_DIR = os.path.dirname(__file__)
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+# ---------- AI 解析（Google Gemini，免费层级；未配置时用本地规则兜底） ----------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
+BOOKING_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "customer_name": {"type": "STRING", "nullable": True},
+        "phone_number": {"type": "STRING", "nullable": True},
+        "service_name": {"type": "STRING", "nullable": True},
+        "price": {"type": "NUMBER", "nullable": True},
+        "booking_time_local": {"type": "STRING", "nullable": True},
+    },
+    "required": ["customer_name", "phone_number", "service_name", "price", "booking_time_local"],
+}
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # 启动时：建表 + 种入演示店铺（若还没有任何店铺）+ 起后台定时任务
+    init_db()
+    seed_demo_shop()
+
+    # 安全自检：把危险配置暴露在启动日志里，便于部署前发现。
+    if not os.getenv("SECRET_KEY"):
+        print("[SECURITY-WARN] SECRET_KEY 未设置：JWT 使用随机临时密钥，"
+              "重启后所有会话失效，且不应视为安全部署。请在 .env 中设置固定强随机值。")
+    sa_pw = os.getenv("SUPER_ADMIN_PASSWORD", "")
+    if not sa_pw or sa_pw in ("super123", "changeme", "admin"):
+        print("[SECURITY-WARN] SUPER_ADMIN_PASSWORD 使用了弱密码或默认值，"
+              "请在生产环境改为强随机密码。")
+
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="Booking System (Free, Multi-tenant)", lifespan=lifespan)
+
+
+# ---------- 数据模型 ----------
+class BookingIn(BaseModel):
+    service_id: int
+    start_local: str   # 本地时间 ISO，如 2026-08-18T14:30
+    customer_name: str
+    customer_email: str
+    phone: str = ""     # 选填（老板用 AI 粘贴短信时可能有）
+    repeat_weeks: int = 1  # 循环预约：每周重复 N 次（默认 1 = 不循环）
+
+
+class ServiceIn(BaseModel):
+    name: str
+    duration_min: int = 30
+    price: float = 0
+
+
+class OwnerLogin(BaseModel):
+    username: str
+    password: str
+
+
+class SuperLogin(BaseModel):
+    password: str
+
+
+class CreateShopIn(BaseModel):
+    shop_name: str
+    owner_username: str
+    owner_password: str
+
+
+class StatusUpdate(BaseModel):
+    status: str
+
+
+class BookingUpdate(BaseModel):
+    status: str = None        # pending / confirmed / done / no_show / cancelled
+    start_local: str = None   # 改期用，本地时间 ISO，如 2026-08-18T14:30
+
+
+class AIParseIn(BaseModel):
+    raw_text: str
+
+
+class ShopUpdate(BaseModel):
+    opening_hours: str = None   # JSON 文本：{weekday: [["HH:MM","HH:MM"], ...] | null}
+    slot_minutes: int = None
+    daily_capacity: int = None  # 每日最多预约数；0 / None = 不限
+
+
+class BlackoutIn(BaseModel):
+    date: str            # "YYYY-MM-DD"
+    note: str = None
+
+
+class RescheduleIn(BaseModel):
+    # 改期只需要新时间；其余字段可选（向后兼容旧前端）
+    start_local: str
+    service_id: int = None
+    customer_name: str = None
+    customer_email: str = None
+
+
+# ---------- 工具函数 ----------
+def to_utc_local(start_local_str: str):
+    dt = datetime.fromisoformat(start_local_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=SHOP_TZ)
+    return dt, dt.astimezone(timezone.utc)
+
+
+def get_shop_by_slug(slug: str):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM shops WHERE slug = ?", (slug,)).fetchone()
+    conn.close()
+    return row
+
+
+def occupied_intervals(date_str: str, shop_id: int):
+    """返回某店某天本地已被占用的 (start, end) 区间列表。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT b.start_utc, s.duration_min FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.shop_id = ? AND b.status IN ('pending','confirmed')",
+        (shop_id,),
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        if start.date().isoformat() != date_str:
+            continue
+        out.append((start, start + timedelta(minutes=r["duration_min"])))
+    return out
+
+
+def generate_slots(service_id: int, date_str: str, shop_id: int):
+    conn = get_conn()
+    svc = conn.execute(
+        "SELECT * FROM services WHERE id = ? AND shop_id = ?", (service_id, shop_id)
+    ).fetchone()
+    shop = conn.execute("SELECT * FROM shops WHERE id = ?", (shop_id,)).fetchone()
+    # 特定日期休假 / 关店：直接无时段
+    blk = {r["date_str"] for r in conn.execute(
+        "SELECT date_str FROM blackout_dates WHERE shop_id = ?", (shop_id,)).fetchall()}
+    # 每日容量：已达上限则当天无时段
+    cap = shop["daily_capacity"] if shop else 0
+    day_count = 0
+    if cap:
+        # 容量只统计「仍占用档期」的预约（pending/confirmed）；
+        # done / no_show 已经发生过，不应再占用当天未来的容量。
+        rows = conn.execute(
+            "SELECT start_utc FROM bookings WHERE shop_id = ? "
+            "AND status IN ('pending','confirmed')",
+            (shop_id,)).fetchall()
+        day_count = sum(
+            1 for r in rows
+            if datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ).date().isoformat() == date_str)
+    conn.close()
+    if not svc or not shop:
+        return []
+    if date_str in blk:
+        return []
+    if cap and day_count >= cap:
+        return []
+    dur = svc["duration_min"]
+    step = shop["slot_minutes"] or 30  # 防御：避免 None/0 导致崩溃或死循环
+    day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    windows = day_hours(shop, day.weekday())
+    if not windows:  # 当天休息
+        return []
+    occ = occupied_intervals(date_str, shop_id)
+    now_local = datetime.now(SHOP_TZ)
+    slots = []
+    for (open_h, open_m, close_h, close_m) in windows:
+        cur = datetime(day.year, day.month, day.day, open_h, open_m, tzinfo=SHOP_TZ)
+        day_end = datetime(day.year, day.month, day.day, close_h, close_m, tzinfo=SHOP_TZ)
+        while cur + timedelta(minutes=dur) <= day_end:
+            end = cur + timedelta(minutes=dur)
+            if cur <= now_local:
+                cur += timedelta(minutes=step)
+                continue
+            overlap = any(not (end <= o0 or cur >= o1) for o0, o1 in occ)
+            if not overlap:
+                slots.append({
+                    "start_local": cur.isoformat(),
+                    "start_utc": cur.astimezone(timezone.utc).isoformat(),
+                    "label": cur.strftime("%H:%M"),
+                })
+            cur += timedelta(minutes=step)
+    return slots
+
+
+def _slot_free(shop_id: int, service_id: int, start_local_dt: datetime):
+    """判断某本地时间点是否可约（休息日/blackout/已占用/超容量 任一则不可）。
+    按「本地墙钟时间」比较，避免 NZ 夏令时切换导致 +12/+13 偏移字符串不一致。"""
+    date_str = start_local_dt.date().isoformat()
+    target = start_local_dt.astimezone(SHOP_TZ).replace(tzinfo=None)
+    return any(
+        datetime.fromisoformat(s["start_local"]).astimezone(SHOP_TZ).replace(tzinfo=None) == target
+        for s in generate_slots(service_id, date_str, shop_id)
+    )
+
+
+def bookings_for_date(date_str: str, shop_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT b.id, s.name, b.customer_name, b.customer_email, b.start_utc, "
+        "b.customer_phone, b.status "
+        "FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.shop_id = ? ORDER BY b.start_utc",
+        (shop_id,),
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        if start.date().isoformat() != date_str:
+            continue
+        out.append({
+            "id": r["id"],
+            "service": r["name"],
+            "name": r["customer_name"],
+            "email": r["customer_email"],
+            "phone": r["customer_phone"],
+            "time": start.strftime("%H:%M"),
+            "status": r["status"],
+        })
+    return out
+
+
+def _ics_escape(text: str) -> str:
+    """RFC 5545 文本转义：反斜杠、换行、逗号、分号都必须转义，
+    否则顾客姓名里的「,」「;」会破坏 .ics 解析（例如 "Smith, John"）。"""
+    if not text:
+        return ""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+    )
+
+
+def ics_event(bid, service_name, name, email, phone, start_local_dt, end_local_dt):
+    """返回一条 VEVENT 的行列表（不含外层 VCALENDAR）。"""
+    def fmt(dt):
+        return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    desc = f"Customer: {name or 'N/A'}"
+    if email:
+        desc += f"\nEmail: {email}"
+    if phone:
+        desc += f"\nPhone: {phone}"
+    return [
+        "BEGIN:VEVENT",
+        f"UID:{bid}@freebooking.local",
+        f"DTSTAMP:{fmt(datetime.now(timezone.utc))}",
+        f"DTSTART:{fmt(start_local_dt)}",
+        f"DTEND:{fmt(end_local_dt)}",
+        f"SUMMARY:{_ics_escape(service_name)}",
+        f"DESCRIPTION:{_ics_escape(desc)}",
+        "END:VEVENT",
+    ]
+
+
+def build_ics(bid, service_name, name, email, phone, start_local_dt, end_local_dt):
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//FreeBooking//EN"]
+    lines += ics_event(bid, service_name, name, email, phone, start_local_dt, end_local_dt)
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines)
+
+
+# ---------- 邮件辅助（免费：本地 SMTP；未配置时仅打印日志） ----------
+def _public_url():
+    return os.getenv("PUBLIC_URL", "http://localhost:8000")
+
+
+def google_cal_link(summary, start_local_dt, end_local_dt, details=""):
+    """生成「添加到 Google 日历」的一键链接。"""
+    def f(d):
+        return d.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    params = urlencode({
+        "action": "TEMPLATE",
+        "text": summary,
+        "dates": f"{f(start_local_dt)}/{f(end_local_dt)}",
+        "details": details,
+    })
+    return f"https://calendar.google.com/calendar/render?{params}"
+
+
+def email_booking_confirmation(slug, shop_name, items):
+    """预约成功后：给客户发确认邮件（支持单次或循环系列）。
+    items: 列表，每项 {service_name, name, email, start_local_dt, end_local_dt,
+                       manage_url, ics_url, gcal_url}
+    """
+    if not items:
+        return
+    name = items[0]["name"]
+    email = items[0]["email"]
+    if not email:
+        return
+    if len(items) == 1:
+        it = items[0]
+        when = it["start_local_dt"].strftime("%A %d %B %Y %H:%M")
+        body = (
+            f"Kia ora {name},\n\n"
+            f"Your {it['service_name']} appointment at {shop_name} is confirmed:\n"
+            f"  When:  {when} (Auckland time)\n\n"
+            f"Add to your calendar:\n"
+            f"  Google Calendar: {it['gcal_url']}\n"
+            f"  Apple / Outlook (.ics): {it['ics_url']}\n\n"
+            f"Need to change or cancel? Manage your booking:\n"
+            f"  {it['manage_url']}\n\n"
+            f"We'll send a reminder 24h before. See you soon!"
+        )
+        send_email(email, f"Booking confirmed · {shop_name}", body)
+    else:
+        lines = [f"Kia ora {name},\n\n"
+                 f"You're booked for {len(items)} weekly sessions at {shop_name}:\n"]
+        for i, it in enumerate(items, 1):
+            when = it["start_local_dt"].strftime("%A %d %B %Y %H:%M")
+            lines.append(
+                f"  {i}. {it['service_name']} — {when} (Auckland time)\n"
+                f"     Manage: {it['manage_url']}\n"
+                f"     Calendar: {it['gcal_url']}\n")
+        lines.append("\nWe'll send a reminder 24h before each session. See you soon!")
+        send_email(email, f"{len(items)} bookings confirmed · {shop_name}",
+                   "\n".join(lines))
+
+
+_STATUS_EMAILS = {
+    "pending": ("Booking updated",
+                "Your booking status is now: pending confirmation."),
+    "confirmed": ("Booking confirmed",
+                  "Your booking is confirmed."),
+    "done": ("Booking completed",
+             "Thanks for visiting! Your appointment is marked as completed."),
+    "no_show": ("Missed appointment",
+                "You were marked as a no-show. Please contact the shop if this was a mistake."),
+    "cancelled": ("Booking cancelled",
+                  "Your appointment has been cancelled."),
+}
+
+
+def email_status_change(shop_name, service_name, name, email, start_local_dt, new_status):
+    """状态变更 / 取消时：给客户发对应提示邮件。"""
+    if not email:
+        return
+    subj, text = _STATUS_EMAILS.get(new_status, ("Booking update", "Your booking was updated."))
+    when = start_local_dt.strftime("%A %d %B %Y %H:%M")
+    body = (
+        f"Kia ora {name},\n\n"
+        f"{text}\n"
+        f"  Service: {service_name}\n"
+        f"  When: {when} (Auckland time)\n"
+        f"  Shop: {shop_name}\n"
+    )
+    send_email(email, f"{subj} · {shop_name}", body)
+
+
+def email_reschedule(slug, bid, shop_name, service_name, name, email,
+                     old_start, new_start, duration_min=30):
+    """改期后：给客户发改期通知（含新日历链接）。"""
+    if not email:
+        return
+    end = new_start + timedelta(minutes=duration_min or 30)
+    # 取该预约的随机管理令牌，拼进 ics 链接（ics 端点已要求 token 才能访问）
+    tk = ""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT manage_token FROM bookings WHERE id = ? AND shop_id = ?",
+            (bid, s["id"]),
+        ).fetchone()
+        tk = row["manage_token"] if row else ""
+        conn.close()
+    except Exception:
+        pass
+    ics = f"{_public_url()}/api/book/{slug}/booking/{bid}/ics?token={tk}"
+    gcal = google_cal_link(f"{service_name} · {shop_name}", new_start, end,
+                           f"Booking at {shop_name}")
+    old = old_start.strftime("%A %d %B %Y %H:%M")
+    new = new_start.strftime("%A %d %B %Y %H:%M")
+    body = (
+        f"Kia ora {name},\n\n"
+        f"Your {service_name} appointment time has been changed by {shop_name}:\n"
+        f"  Old time: {old}\n"
+        f"  New time: {new} (Auckland time)\n\n"
+        f"Updated calendar link:\n"
+        f"  Google Calendar: {gcal}\n"
+        f"  Apple / Outlook (.ics): {ics}\n"
+    )
+    send_email(email, f"Appointment rescheduled · {shop_name}", body)
+
+
+# ---------- JWT 鉴权依赖 ----------
+def get_current_user(request: Request):
+    """从 Bearer token 解码出当前登录用户，失败返回 401。"""
+    tok = request.headers.get("Authorization", "")
+    if tok.startswith("Bearer "):
+        tok = tok[7:]
+    data = decode_token(tok)
+    if not data:
+        raise HTTPException(401, "unauthorized")
+    return data  # 含 sub(user_id), shop_id, role
+
+
+def require_role(request: Request, role: str):
+    u = get_current_user(request)
+    if u.get("role") != role:
+        raise HTTPException(403, "forbidden")
+    return u
+
+
+# ---------- AI 智能解析：把老板的短信/笔记变成预约 ----------
+SYSTEM_PROMPT = (
+    "You are a booking parser for a small business in Auckland, New Zealand.\n"
+    "The CURRENT local date and time in Auckland (timezone Pacific/Auckland, which "
+    "automatically observes NZDT/NZST daylight saving) is:\n"
+    "  {now}\n\n"
+    "Parse the owner's note and extract a SINGLE booking. Reply with ONLY a JSON "
+    "object matching this exact schema (no markdown, no extra text):\n"
+    "- customer_name: the customer's name (string), or null if not mentioned.\n"
+    "- phone_number: NZ mobile number in +64 international format with no spaces, "
+    "  e.g. \"+64211234567\". Drop a leading 0 and add +64. null if not mentioned.\n"
+    "- service_name: the service type, e.g. \"Haircut\", \"Piano lesson\" (string), "
+    "  or null if not mentioned.\n"
+    "- price: the amount in NZD as a number (no $ sign), or null if not mentioned.\n"
+    "- booking_time_local: the appointment time as a LOCAL Auckland ISO-8601 datetime "
+    "  with no timezone, e.g. \"2026-08-18T15:00:00\". Resolve relative words "
+    "  (\"tomorrow\", \"Tuesday\", \"next Monday\", \"3pm\") using the current Auckland "
+    "  time shown above. null if not mentioned.\n\n"
+    "If a field is NOT present in the text, output null for it. Do not invent values."
+)
+
+
+def parse_booking_text(raw_text: str, shop_id: int):
+    """优先用 Gemini；若未配置密钥或调用失败，自动回退到本地规则解析。"""
+    now_akl = datetime.now(SHOP_TZ)
+    if GEMINI_API_KEY:
+        try:
+            return _parse_with_gemini(raw_text, now_akl)
+        except Exception as e:
+            print("[ai] Gemini failed, falling back to local parser:", e)
+    return _parse_with_rules(raw_text, now_akl, shop_id)
+
+
+def _parse_with_gemini(raw_text: str, now_akl):
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    now_str = now_akl.strftime("%Y-%m-%d %H:%M:%S (%A)")
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=raw_text,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT.format(now=now_str),
+            response_mime_type="application/json",
+            response_schema=BOOKING_SCHEMA,
+        ),
+    )
+    data = json.loads(resp.text)
+    data["source"] = "gemini"
+    return data
+
+
+# ---- 本地规则兜底解析（无需联网/密钥，可立即使用）----
+_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def _resolve_date(text: str, now_akl):
+    t = text.lower()
+    today = now_akl.date()
+    if "tomorrow" in t:
+        return today + timedelta(days=1)
+    if "today" in t:
+        return today
+    for i, d in enumerate(_DAYS):
+        if d in t:
+            delta = (i - today.weekday()) % 7
+            if "next" in t and delta == 0:
+                delta = 7
+            return today + timedelta(days=delta)
+    return today
+
+
+def _resolve_time(text: str):
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", text, re.I)
+    if m:
+        h = int(m.group(1))
+        mm = int(m.group(2) or 0)
+        ap = m.group(3).lower()
+        if ap == "pm" and h != 12:
+            h += 12
+        if ap == "am" and h == 12:
+            h = 0
+        return h, mm
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _resolve_phone(text: str):
+    m = re.search(r"(?:\+?64|0)\s*2[\d\s]{6,13}", text)
+    if not m:
+        return None
+    digits = re.sub(r"\s+", "", m.group(0)).replace("+", "")
+    if digits.startswith("64"):
+        return "+64" + digits[2:]
+    if digits.startswith("0"):
+        return "+64" + digits[1:]
+    return "+" + digits
+
+
+def _resolve_price(text: str):
+    m = re.search(r"\$\s?(\d+(?:\.\d{1,2})?)", text)
+    return float(m.group(1)) if m else None
+
+
+def _resolve_service(text: str, shop_id: int):
+    """在「本店」已有服务中匹配；匹配不到再用保守关键词映射。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT name FROM services WHERE shop_id = ?", (shop_id,)
+    ).fetchall()
+    conn.close()
+    tl = text.lower()
+    for r in rows:
+        if r["name"].lower() in tl:
+            return r["name"]
+    for kw, svc in _SERVICE_KEYWORDS:
+        if kw in tl:
+            return svc
+    return None
+
+
+def _resolve_name(text: str):
+    m = re.search(r"kia ora,?\s*([A-Z][a-zA-Z]+)", text, re.I)
+    if m:
+        return m.group(1)
+    stop = set(_DAYS) | {"tomorrow", "today", "next", "txt", "text", "pm", "am"}
+    for w in re.findall(r"\b([A-Z][a-zA-Z]+)\b", text):
+        if w.lower() not in stop:
+            return w
+    return None
+
+
+_SERVICE_KEYWORDS = [
+    ("piano", "Piano lesson"),
+    ("lesson", "Lesson"),
+    ("haircut", "Haircut"),
+    ("hair cut", "Haircut"),
+    ("trim", "Haircut"),
+    ("training", "Personal training"),
+    ("trainer", "Personal training"),
+    ("gym", "Personal training"),
+    ("session", "Session"),
+    ("massage", "Massage"),
+    ("cut", "Haircut"),
+]
+
+
+def _parse_with_rules(raw_text: str, now_akl, shop_id: int):
+    text = raw_text
+    day = _resolve_date(text, now_akl)
+    tm = _resolve_time(text)
+    if tm:
+        dt_local = datetime(day.year, day.month, day.day, tm[0], tm[1], tzinfo=SHOP_TZ)
+        booking_time_local = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
+    else:
+        booking_time_local = None
+    return {
+        "customer_name": _resolve_name(text),
+        "phone_number": _resolve_phone(text),
+        "service_name": _resolve_service(text, shop_id),
+        "price": _resolve_price(text),
+        "booking_time_local": booking_time_local,
+        "source": "fallback",
+    }
+
+
+def _match_or_create_service(conn, name, price, shop_id):
+    """在「本店」内匹配服务；匹配不到则新建（价格取解析值，默认 0）。"""
+    if not name:
+        return None, None, False
+    tl = name.lower()
+    rows = conn.execute(
+        "SELECT id, name FROM services WHERE shop_id = ?", (shop_id,)
+    ).fetchall()
+    for r in rows:
+        rn = r["name"].lower()
+        if rn == tl or rn in tl or tl in rn:
+            return r["id"], r["name"], False
+    price = price if isinstance(price, (int, float)) else 0
+    cur = conn.execute(
+        "INSERT INTO services(shop_id, name, duration_min, price) VALUES (?, ?, ?, ?)",
+        (shop_id, name, 30, price),
+    )
+    conn.commit()
+    return cur.lastrowid, name, True
+
+
+def save_ai_booking(parsed: dict, shop_id: int):
+    """把解析结果写入「本店」bookings 表（状态默认 confirmed）。"""
+    if not parsed.get("service_name"):
+        raise HTTPException(400, "未能从文本中识别出服务，请检查文本或手动添加。")
+    if not parsed.get("booking_time_local"):
+        raise HTTPException(400, "未能从文本中识别出预约时间，请检查文本。")
+
+    conn = get_conn()
+    try:
+        sid, sname, created = _match_or_create_service(
+            conn, parsed["service_name"], parsed.get("price"), shop_id
+        )
+        try:
+            _, utc_dt = to_utc_local(parsed["booking_time_local"])
+        except Exception:
+            raise HTTPException(400, "预约时间格式无法解析。")
+        local_dt = utc_dt.astimezone(SHOP_TZ)
+
+        # 与顾客端下单保持一致：校验该时段确实可约，避免 AI 解析结果覆盖已有预约（P1-6）
+        if not _slot_free(shop_id, sid, local_dt):
+            raise HTTPException(409, "该时段不可预约（可能已满、已占用或当天休息）。")
+
+        phone = parsed.get("phone_number") or ""
+        name = parsed.get("customer_name")
+        try:
+            cur = conn.execute(
+                "INSERT INTO bookings(shop_id, service_id, start_utc, customer_phone, status, customer_name) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (shop_id, sid, utc_dt.isoformat(), phone, "confirmed", name),
+            )
+        except IntegrityError:
+            # 与已有预约时段冲突（UNIQUE(shop_id, start_utc)）：明确告知，而非 500
+            raise HTTPException(409, "该时段已被占用，请换个时间。")
+        bid = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "booking_id": bid,
+        "customer_name": name,
+        "phone_number": phone,
+        "service_name": sname,
+        "price": parsed.get("price"),
+        "booking_time_local": local_dt.isoformat(),
+        "booking_time_utc": utc_dt.isoformat(),
+        "service_created": created,
+        "source": parsed.get("source"),
+    }
+
+
+# ===================== 顾客端 API（按 shop_slug 隔离） =====================
+@app.get("/api/book/{slug}/shop")
+def customer_shop(slug: str):
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    return {
+        "name": s["name"],
+        "slug": s["slug"],
+        "open": s["business_hours_start"],
+        "close": s["business_hours_end"],
+        "slot_minutes": s["slot_minutes"],
+        "opening_hours": (s["opening_hours"] or json.dumps(DEFAULT_OPENING_HOURS)),
+        "blackout_dates": [b["date"] for b in list_blackouts(s["id"])],
+        "timezone": os.getenv("SHOP_TZ", "Pacific/Auckland"),
+    }
+
+
+@app.get("/api/book/{slug}/services")
+def customer_services(slug: str):
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, name, duration_min, price FROM services WHERE shop_id = ? ORDER BY id",
+        (s["id"],),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/book/{slug}/availability")
+def customer_availability(slug: str, service_id: int, date: str):
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    return generate_slots(service_id, date, s["id"])
+
+
+def make_manage_token():
+    """生成一个随机、不可猜测的顾客自助管理令牌。"""
+    return secrets.token_urlsafe(16)
+
+
+def _email_item(slug, bid, shop_name, service_name, name, email,
+                start_local_dt, end_local_dt, token):
+    """构造一封确认邮件里的一个预约条目（含 .ics / Google / 自助管理链接）。"""
+    return {
+        "service_name": service_name,
+        "name": name,
+        "email": email,
+        "start_local_dt": start_local_dt,
+        "end_local_dt": end_local_dt,
+        "ics_url": f"{_public_url()}/api/book/{slug}/booking/{bid}/ics?token={token}",
+        "gcal_url": google_cal_link(f"{service_name} · {shop_name}", start_local_dt,
+                                    end_local_dt, f"Booking at {shop_name}"),
+        "manage_url": f"{_public_url()}/manage/{slug}/{token}",
+    }
+
+
+@app.post("/api/book/{slug}/bookings")
+def customer_create_booking(slug: str, body: BookingIn):
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    shop_id = s["id"]
+    # 校验姓名 + 邮箱（替代原先的手机校验）
+    name = (body.customer_name or "").strip()
+    email = (body.customer_email or "").strip().lower()
+    if not name:
+        raise HTTPException(400, "请填写您的姓名")
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise HTTPException(400, "请输入有效的电子邮箱")
+    weeks = int(body.repeat_weeks)
+    if weeks < 1 or weeks > 52:
+        raise HTTPException(400, "repeat_weeks 必须在 1-52 之间")
+
+    start_local0, _ = to_utc_local(body.start_local)
+    conn = get_conn()
+    try:
+        svc = conn.execute(
+            "SELECT * FROM services WHERE id = ? AND shop_id = ?", (body.service_id, shop_id)
+        ).fetchone()
+        if not svc:
+            raise HTTPException(400, "service not found in this shop")
+        dur = svc["duration_min"]
+
+        # 逐个星期创建（首周 + 后续 repeat_weeks-1 周）
+        # 关键：保持「本地墙钟时间」不变（例如每周一 14:00）。
+        # 不能用 (墙钟 aware 时间 + timedelta(weeks=w))，因为跨 NZ 夏令时切换时，
+        # 整段 timedelta 会把墙钟时间整体平移 1 小时（如 14:00 → 15:00）。
+        # 正确做法：只在「朴素日期」上加日历周数，再重新套用 SHOP_TZ。
+        base_date = start_local0.date()
+        base_time = start_local0.time()
+        created = []
+        for w in range(weeks):
+            d = base_date + timedelta(weeks=w)
+            sl_dt = datetime(d.year, d.month, d.day, base_time.hour, base_time.minute,
+                             tzinfo=SHOP_TZ)
+            if not _slot_free(shop_id, body.service_id, sl_dt):
+                # 该周不可约（休息/已满/已占用/过去）：跳过这一周，不中断整批
+                continue
+            sl_end = sl_dt + timedelta(minutes=dur)
+            token = make_manage_token()
+            try:
+                cur = conn.execute(
+                    "INSERT INTO bookings(shop_id, service_id, start_utc, customer_name, "
+                    "customer_email, customer_phone, status, manage_token) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (shop_id, body.service_id, sl_dt.astimezone(timezone.utc).isoformat(),
+                     name, email, body.phone or "", "pending", token),
+                )
+            except IntegrityError:
+                # 并发下另一请求已抢先占用了同一时段（UNIQUE(shop_id, start_utc)）。
+                # 跳过这一周，不把同一时段卖给两个顾客。
+                continue
+            bid = cur.lastrowid
+            conn.commit()  # 提交以便下一周的 _slot_free 能看到本批已建预约
+            end_utc = sl_end.astimezone(timezone.utc)
+            # 同步到老板的 Google Calendar（需自行配置）
+            push_event(svc["name"], name, email, sl_dt.astimezone(timezone.utc).isoformat(),
+                       end_utc.isoformat())
+            # 给老板发新预约通知邮件
+            send_email(
+                os.getenv("SHOP_EMAIL", ""),
+                f"新预约：{svc['name']}",
+                f"顾客 {name} ({email}) 预约 {sl_dt.strftime('%Y-%m-%d %H:%M')}",
+            )
+            created.append((bid, sl_dt, sl_end, token))
+
+        if not created:
+            raise HTTPException(409, "所选时间均不可预约（可能已满、已占用或当天休息）")
+
+        # 给顾客发确认邮件（含每单的自助管理链接）
+        items = [_email_item(slug, bid, s["name"], svc["name"], name, email, sl, sl_end, tok)
+                 for (bid, sl, sl_end, tok) in created]
+        email_booking_confirmation(slug, s["name"], items)
+
+        first = created[0]
+        return {
+            "id": first[0],
+            "start_local": first[1].isoformat(),
+            "service": svc["name"],
+            "customer_name": name,
+            "customer_email": email,
+            "manage_token": first[3],
+            "manage_url": f"/manage/{slug}/{first[3]}",
+            "series": [{"id": bid, "start_local": sl.isoformat(), "service": svc["name"],
+                        "manage_token": tok, "manage_url": f"/manage/{slug}/{tok}"}
+                       for (bid, sl, _, tok) in created],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/book/{slug}/booking/{bid}/ics")
+def customer_ics(slug: str, bid: int, token: str = ""):
+    """顾客的 .ics 日历文件下载。
+    必须与预约创建时返回的随机 manage_token 匹配，才能访问 —— 这样攻击者无法用
+    顺序 bid 枚举出所有顾客的姓名/邮箱/手机号（Privacy Act 通报级的数据泄露）。
+    """
+    s, b = get_booking_by_token(slug, token)
+    # 额外校验 bid 与 token 对应的是同一笔预约，避免用 A 的 token 看 B 的 ics
+    if not b or b["id"] != bid:
+        raise HTTPException(404, "not found")
+    start = datetime.fromisoformat(b["start_utc"]).astimezone(SHOP_TZ)
+    end = start + timedelta(minutes=b["duration_min"])
+    data = build_ics(bid, b["name"], b["customer_name"], b["customer_email"],
+                     b["customer_phone"], start, end)
+    return Response(
+        data,
+        media_type="text/calendar",
+        headers={"Content-Disposition": f'attachment; filename="booking-{bid}.ics"'},
+    )
+
+
+# ---------- 顾客自助管理（无需登录，凭随机 token 操作） ----------
+def get_booking_by_token(slug: str, token: str):
+    """按 slug + manage_token 找到预约，并确认令牌合法。"""
+    s = get_shop_by_slug(slug)
+    if not s:
+        return None, None
+    conn = get_conn()
+    b = conn.execute(
+        "SELECT b.*, s.name, s.duration_min FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.manage_token = ? AND b.shop_id = ?", (token, s["id"])
+    ).fetchone()
+    conn.close()
+    return s, b
+
+
+@app.get("/api/book/{slug}/manage/{token}")
+def customer_manage_detail(slug: str, token: str):
+    s, b = get_booking_by_token(slug, token)
+    if not b:
+        raise HTTPException(404, "booking not found")
+    start = datetime.fromisoformat(b["start_utc"]).astimezone(SHOP_TZ)
+    end = start + timedelta(minutes=b["duration_min"])
+    return {
+        "id": b["id"],
+        "shop_name": s["name"],
+        "service": b["name"],
+        "service_id": b["service_id"],
+        "customer_name": b["customer_name"],
+        "customer_email": b["customer_email"],
+        "start_local": start.isoformat(),
+        "end_local": end.isoformat(),
+        "status": b["status"],
+        "manage_url": f"{_public_url()}/manage/{slug}/{token}",
+        "ics_url": f"{_public_url()}/api/book/{slug}/booking/{b['id']}/ics?token={b['manage_token']}",
+        "gcal_url": google_cal_link(f"{b['name']} · {s['name']}", start, end,
+                                    f"Booking at {s['name']}"),
+    }
+
+
+@app.post("/api/book/{slug}/manage/{token}/cancel")
+def customer_manage_cancel(slug: str, token: str):
+    s, b = get_booking_by_token(slug, token)
+    if not b:
+        raise HTTPException(404, "booking not found")
+    if b["status"] == "cancelled":
+        return {"ok": True, "already": True}
+    conn = get_conn()
+    conn.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (b["id"],))
+    conn.commit()
+    conn.close()
+    start = datetime.fromisoformat(b["start_utc"]).astimezone(SHOP_TZ)
+    # 给顾客发取消通知
+    email_status_change(s["name"], b["name"], b["customer_name"], b["customer_email"],
+                        start, "cancelled")
+    # 给老板发通知
+    send_email(os.getenv("SHOP_EMAIL", ""), f"预约已取消：{b['name']}",
+               f"顾客 {b['customer_name']} 取消了 {start.strftime('%Y-%m-%d %H:%M')} 的预约")
+    return {"ok": True}
+
+
+@app.post("/api/book/{slug}/manage/{token}/reschedule")
+def customer_manage_reschedule(slug: str, token: str, body: RescheduleIn):
+    s, b = get_booking_by_token(slug, token)
+    if not b:
+        raise HTTPException(404, "booking not found")
+    if b["status"] == "cancelled":
+        raise HTTPException(400, "该预约已取消，无法改期")
+    new_local, _ = to_utc_local(body.start_local)
+    if not _slot_free(s["id"], b["service_id"], new_local):
+        raise HTTPException(409, "新时间不可预约（可能已满或已占用）")
+    old_start = datetime.fromisoformat(b["start_utc"]).astimezone(SHOP_TZ)
+    conn = get_conn()
+    conn.execute("UPDATE bookings SET start_utc = ? WHERE id = ?",
+                 (new_local.astimezone(timezone.utc).isoformat(), b["id"]))
+    conn.commit()
+    conn.close()
+    email_reschedule(slug, b["id"], s["name"], b["name"], b["customer_name"],
+                     b["customer_email"], old_start, new_local, b["duration_min"])
+    return {"ok": True, "start_local": new_local.isoformat()}
+
+
+# 顾客自助管理页面（无需登录）
+@app.get("/manage/{slug}/{token}")
+def serve_manage_page(slug: str, token: str):
+    s, b = get_booking_by_token(slug, token)
+    if not b:
+        raise HTTPException(404, "booking not found")
+    return FileResponse(os.path.join(STATIC_DIR, "manage.html"))
+
+
+# 给店主生成一个「日历订阅链接」用的私密 token（HMAC，无需新增数据库列）
+def calendar_token(slug: str) -> str:
+    # 复用 auth_utils.SECRET_KEY（若未配置则是本次启动的随机临时密钥），
+    # 避免与 JWT 签名密钥不一致、或回退到可被预测的硬编码值。
+    key = SECRET_KEY.encode()
+    digest = hmac.new(key, slug.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+@app.get("/api/book/{slug}/calendar.ics")
+def public_calendar(slug: str, t: str = ""):
+    """店主的 iCal 订阅源（可被 Google/Apple/Outlook 订阅，自动同步排班）。
+    通过 URL 中的 HMAC token 保护，不知道链接的人无法访问。"""
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    if not hmac.compare_digest(t, calendar_token(slug)):
+        raise HTTPException(403, "invalid token")
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT b.id, s.name, b.customer_name, b.customer_phone, b.customer_email, "
+        "b.start_utc, s.duration_min FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.shop_id = ? AND b.status != 'cancelled' ORDER BY b.start_utc",
+        (s["id"],),
+    ).fetchall()
+    conn.close()
+    # REFRESH-INTERVAL / X-PUBLISHED-TTL：让 Google/Apple/Outlook 更频繁地自动刷新订阅
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//FreeBooking//EN",
+             "REFRESH-INTERVAL;VALUE=DURATION:PT1H", "X-PUBLISHED-TTL:PT1H"]
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        end = start + timedelta(minutes=r["duration_min"])
+        lines += ics_event(r["id"], r["name"], r["customer_name"],
+                           r["customer_email"], r["customer_phone"], start, end)
+    lines.append("END:VCALENDAR")
+    data = "\r\n".join(lines)
+    return Response(
+        data,
+        media_type="text/calendar",
+        headers={"Content-Disposition": f'attachment; filename="{slug}-calendar.ics"'},
+    )
+
+
+@app.get("/api/book/{slug}/qr")
+def customer_qr(slug: str):
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    import io
+    import qrcode
+    base = os.getenv("PUBLIC_URL", "http://localhost:8000")
+    url = f"{base}/book/{slug}"
+    img = qrcode.make(url)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return Response(buf.getvalue(), media_type="image/png")
+
+
+# 顾客预约页：用店铺专属 URL 访问（同一个 HTML，前端按 slug 加载本店数据）
+@app.get("/book/{slug}")
+def serve_booking_page(slug: str):
+    s = get_shop_by_slug(slug)
+    if not s:
+        raise HTTPException(404, "shop not found")
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+# ===================== 老板端 API（JWT，强制本店隔离） =====================
+@app.post("/api/admin/login")
+def admin_login(body: OwnerLogin):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM users WHERE username = ? AND role = 'shop_owner'",
+        (body.username,),
+    ).fetchone()
+    conn.close()
+    if not row or not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(401, "wrong username or password")
+    token = create_token({"sub": row["id"], "shop_id": row["shop_id"], "role": row["role"]})
+    return {"token": token}
+
+
+@app.get("/api/admin/shop")
+def admin_shop_info(request: Request):
+    u = get_current_user(request)
+    conn = get_conn()
+    s = conn.execute(
+        "SELECT id, name, slug, opening_hours, slot_minutes, daily_capacity "
+        "FROM shops WHERE id = ?", (u["shop_id"],)
+    ).fetchone()
+    conn.close()
+    if not s:
+        raise HTTPException(404, "shop not found")
+    d = dict(s)
+    d["opening_hours"] = s["opening_hours"] or json.dumps(DEFAULT_OPENING_HOURS)
+    d["daily_capacity"] = s["daily_capacity"] or 0
+    d["timezone"] = os.getenv("SHOP_TZ", "Pacific/Auckland")
+    d["calendar_token"] = calendar_token(s["slug"])
+    d["booking_url"] = f"{os.getenv('PUBLIC_URL', 'http://localhost:8000')}/book/{s['slug']}"
+    d["qr_url"] = f"{os.getenv('PUBLIC_URL', 'http://localhost:8000')}/api/book/{s['slug']}/qr"
+    d["calendar_url"] = (f"{os.getenv('PUBLIC_URL', 'http://localhost:8000')}"
+                         f"/api/book/{s['slug']}/calendar.ics?t={d['calendar_token']}")
+    d["blackout_dates"] = list_blackouts(s["id"])
+    return d
+
+
+@app.patch("/api/admin/shop")
+def admin_update_shop(request: Request, body: ShopUpdate):
+    u = get_current_user(request)
+    conn = get_conn()
+    if body.opening_hours is not None:
+        try:
+            json.loads(body.opening_hours)
+        except Exception:
+            conn.close()
+            raise HTTPException(400, "opening_hours 不是合法 JSON")
+        conn.execute(
+            "UPDATE shops SET opening_hours = ? WHERE id = ?",
+            (body.opening_hours, u["shop_id"]),
+        )
+    if body.slot_minutes is not None:
+        if body.slot_minutes < 5:
+            conn.close()
+            raise HTTPException(400, "slot_minutes 最小为 5 分钟")
+        conn.execute(
+            "UPDATE shops SET slot_minutes = ? WHERE id = ?",
+            (body.slot_minutes, u["shop_id"]),
+        )
+    if body.daily_capacity is not None:
+        if body.daily_capacity < 0:
+            conn.close()
+            raise HTTPException(400, "daily_capacity 不能为负数")
+        conn.execute(
+            "UPDATE shops SET daily_capacity = ? WHERE id = ?",
+            (body.daily_capacity, u["shop_id"]),
+        )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+# ---------- 特定日期休假 / 关店（Blackout Dates） ----------
+@app.get("/api/admin/blackout")
+def admin_list_blackout(request: Request):
+    u = get_current_user(request)
+    return {"dates": list_blackouts(u["shop_id"])}
+
+
+@app.post("/api/admin/blackout")
+def admin_add_blackout(request: Request, body: BlackoutIn):
+    u = get_current_user(request)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", body.date or ""):
+        raise HTTPException(400, "date 格式应为 YYYY-MM-DD")
+    add_blackout(u["shop_id"], body.date, body.note)
+    return {"ok": True}
+
+
+@app.delete("/api/admin/blackout/{date}")
+def admin_del_blackout(request: Request, date: str):
+    u = get_current_user(request)
+    remove_blackout(u["shop_id"], date)
+    return {"ok": True}
+
+
+@app.get("/api/admin/export-ics")
+def admin_export_ics(request: Request, from_date: str = None, to_date: str = None):
+    """导出本店全部（或指定日期范围内）预约为单个 .ics 文件，可导入任意日历。"""
+    u = get_current_user(request)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT b.id, s.name, b.customer_name, b.customer_phone, b.customer_email, "
+        "b.start_utc, s.duration_min FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.shop_id = ? ORDER BY b.start_utc",
+        (u["shop_id"],),
+    ).fetchall()
+    conn.close()
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//FreeBooking//EN"]
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        if from_date and start.date().isoformat() < from_date:
+            continue
+        if to_date and start.date().isoformat() > to_date:
+            continue
+        end = start + timedelta(minutes=r["duration_min"])
+        lines += ics_event(r["id"], r["name"], r["customer_name"],
+                           r["customer_email"], r["customer_phone"], start, end)
+    lines.append("END:VCALENDAR")
+    data = "\r\n".join(lines)
+    return Response(
+        data,
+        media_type="text/calendar",
+        headers={"Content-Disposition": 'attachment; filename="schedule.ics"'},
+    )
+
+
+@app.get("/api/admin/bookings")
+def admin_bookings(request: Request, date: str = None,
+                   from_date: str = None, to_date: str = None, q: str = None):
+    """返回本店预约，支持：
+    - 单日 date=YYYY-MM-DD（向后兼容）
+    - 日期范围 from_date / to_date（含边界，本地日期）
+    - 客户姓名/邮箱搜索 q
+    """
+    u = get_current_user(request)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT b.id, s.name, b.customer_name, b.customer_email, b.customer_phone, "
+        "b.start_utc, b.status FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.shop_id = ? ORDER BY b.start_utc",
+        (u["shop_id"],),
+    ).fetchall()
+    conn.close()
+    out = []
+    ql = (q or "").strip().lower()
+    # 老顾客识别：按邮箱汇总该店所有历史预约
+    by_email = {}
+    for r in rows:
+        em = (r["customer_email"] or "").lower()
+        if em:  # 仅按有效邮箱归组，避免空邮箱被错误合并、虚高 visit 数
+            by_email.setdefault(em, []).append(r)
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        local_date = start.date().isoformat()
+        if date and local_date != date:
+            continue
+        if from_date and local_date < from_date:
+            continue
+        if to_date and local_date > to_date:
+            continue
+        if ql:
+            hay = f"{r['customer_name'] or ''} {r['customer_email'] or ''}".lower()
+            if ql not in hay:
+                continue
+        hist = by_email.get((r["customer_email"] or "").lower(), [])
+        visits = len(hist)
+        prior = None  # 本次之前最近一次的服务（用于「上次是 X」提示）
+        for h in hist:
+            if h["start_utc"] < r["start_utc"]:
+                prior = h["name"]
+        out.append({
+            "id": r["id"],
+            "service": r["name"],
+            "name": r["customer_name"],
+            "email": r["customer_email"],
+            "phone": r["customer_phone"],
+            "date": local_date,
+            "time": start.strftime("%H:%M"),
+            "start_utc": r["start_utc"],
+            "status": r["status"],
+            "visits": visits,
+            "returning": visits > 1,
+            "last_service": prior,
+        })
+    return out
+
+
+# ---------- CSV 导出 + 简易报表（免费，纯本地文件） ----------
+@app.get("/api/admin/export-csv")
+def admin_export_csv(request: Request, from_date: str = None, to_date: str = None):
+    """导出本店预约为 CSV（可指定日期范围），方便交给会计。"""
+    u = get_current_user(request)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT b.id, s.name, b.customer_name, b.customer_email, b.status, b.start_utc "
+        "FROM bookings b JOIN services s ON s.id = b.service_id "
+        "WHERE b.shop_id = ? ORDER BY b.start_utc", (u["shop_id"],)
+    ).fetchall()
+    conn.close()
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "time", "service", "customer_name", "customer_email", "status"])
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        ld = start.date().isoformat()
+        if from_date and ld < from_date:
+            continue
+        if to_date and ld > to_date:
+            continue
+        # 防 CSV 注入：以 = + - @ 或 TAB 开头的单元格在 Excel 中会被当作公式执行
+        def _safe(v):
+            v = v or ""
+            return (" " + v) if v[:1] in ("=", "+", "-", "@", "\t") else v
+        w.writerow([ld, start.strftime("%H:%M"), _safe(r["name"]),
+                    _safe(r["customer_name"]), _safe(r["customer_email"]), r["status"]])
+    return Response(
+        buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="bookings.csv"'},
+    )
+
+
+@app.get("/api/admin/stats")
+def admin_stats(request: Request):
+    """简易报表：总预约数、本周预约数、no-show 率。"""
+    u = get_current_user(request)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT status, start_utc FROM bookings WHERE shop_id = ?", (u["shop_id"],)
+    ).fetchall()
+    conn.close()
+    now = datetime.now(SHOP_TZ)
+    week_start = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    total = len(rows)
+    no_show = sum(1 for r in rows if r["status"] == "no_show")
+    week_bookings = 0
+    week_no_show = 0
+    for r in rows:
+        start = datetime.fromisoformat(r["start_utc"]).astimezone(SHOP_TZ)
+        if start >= week_start:
+            week_bookings += 1
+            if r["status"] == "no_show":
+                week_no_show += 1
+    no_show_rate = round(100.0 * no_show / total, 1) if total else 0.0
+    week_rate = round(100.0 * week_no_show / week_bookings, 1) if week_bookings else 0.0
+    return {
+        "total": total,
+        "week_bookings": week_bookings,
+        "no_show": no_show,
+        "no_show_rate": no_show_rate,
+        "week_no_show": week_no_show,
+        "week_no_show_rate": week_rate,
+    }
+
+
+@app.get("/api/admin/services")
+def admin_services(request: Request):
+    u = get_current_user(request)
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, name, duration_min, price FROM services WHERE shop_id = ? ORDER BY id",
+        (u["shop_id"],),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/admin/services")
+def add_service(request: Request, body: ServiceIn):
+    u = get_current_user(request)
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO services(shop_id, name, duration_min, price) VALUES (?, ?, ?, ?)",
+        (u["shop_id"], body.name, body.duration_min, body.price),
+    )
+    conn.commit()
+    conn.close()
+    return {"id": cur.lastrowid}
+
+
+@app.delete("/api/admin/services/{sid}")
+def delete_service(request: Request, sid: int):
+    u = get_current_user(request)
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM services WHERE id = ? AND shop_id = ?", (sid, u["shop_id"])
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "service not found")
+        # 外键已开启：若该服务仍有预约，直接删除会因外键约束失败。
+        # 主动检测并返回明确错误，避免把预约「静默隐藏」后又被重新挂出来（P1-5）。
+        linked = conn.execute(
+            "SELECT 1 FROM bookings WHERE service_id = ? AND shop_id = ? LIMIT 1",
+            (sid, u["shop_id"]),
+        ).fetchone()
+        if linked:
+            raise HTTPException(409,
+                "该服务仍有历史预约，无法删除。可先将其从前端隐藏或保留以提供历史记录。")
+        conn.execute("DELETE FROM services WHERE id = ?", (sid,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.patch("/api/admin/bookings/{bid}")
+def update_booking(request: Request, bid: int, body: BookingUpdate):
+    u = get_current_user(request)
+    conn = get_conn()
+    b = conn.execute(
+        "SELECT b.*, s.name FROM bookings b "
+        "JOIN services s ON s.id = b.service_id "
+        "WHERE b.id = ? AND b.shop_id = ?", (bid, u["shop_id"])
+    ).fetchone()
+    if not b:
+        conn.close()
+        raise HTTPException(404, "booking not found")
+    shop = conn.execute("SELECT name, slug FROM shops WHERE id = ?", (u["shop_id"],)).fetchone()
+    shop_name = shop["name"] if shop else ""
+    shop_slug = shop["slug"] if shop else ""
+
+    changed_status = None
+    rescheduled = False
+    if body.start_local is not None:
+        try:
+            start_local, start_utc = to_utc_local(body.start_local)
+        except Exception:
+            conn.close()
+            raise HTTPException(400, "预约时间格式无法解析")
+        conn.execute("UPDATE bookings SET start_utc = ? WHERE id = ?",
+                     (start_utc.isoformat(), bid))
+        rescheduled = True
+    if body.status is not None:
+        if body.status not in ("pending", "confirmed", "done", "no_show", "cancelled"):
+            conn.close()
+            raise HTTPException(400, "invalid status")
+        conn.execute("UPDATE bookings SET status = ? WHERE id = ?", (body.status, bid))
+        changed_status = body.status
+    conn.commit()
+
+    # 重新读取最新状态用于发邮件
+    b2 = conn.execute(
+        "SELECT b.*, s.name, s.duration_min FROM bookings b "
+        "JOIN services s ON s.id = b.service_id WHERE b.id = ?", (bid,)
+    ).fetchone()
+    conn.close()
+
+    name = b2["customer_name"]
+    email = b2["customer_email"]
+    new_start = datetime.fromisoformat(b2["start_utc"]).astimezone(SHOP_TZ)
+    # 状态变更邮件
+    if changed_status is not None:
+        email_status_change(shop_name, b2["name"], name, email, new_start, changed_status)
+    # 改期邮件（仅在未同时改状态时发送，避免重复打扰）
+    if rescheduled and changed_status is None:
+        old_start = datetime.fromisoformat(b["start_utc"]).astimezone(SHOP_TZ)
+        email_reschedule(shop_slug, bid, shop_name, b2["name"], name, email,
+                         old_start, new_start, b2["duration_min"])
+    return {"ok": True}
+
+
+@app.post("/api/admin/ai-parse-booking")
+def ai_parse_booking(request: Request, body: AIParseIn):
+    """老板粘贴短信/笔记，AI 提取并自动写入「本店」数据库（状态 confirmed）。"""
+    u = get_current_user(request)
+    parsed = parse_booking_text(body.raw_text, u["shop_id"])
+    return save_ai_booking(parsed, u["shop_id"])
+
+
+# ===================== 超级管理员 API（平台方） =====================
+@app.post("/api/super-admin/login")
+def super_admin_login(body: SuperLogin):
+    pw = os.getenv("SUPER_ADMIN_PASSWORD", "")
+    # 恒定时间比较，避免密码比对被计时侧信道攻击
+    if not pw or not secure_compare(body.password, pw):
+        raise HTTPException(401, "wrong password")
+    token = create_token({"sub": 0, "shop_id": None, "role": "super_admin"})
+    return {"token": token, "role": "super_admin"}
+
+
+@app.post("/api/super-admin/create-shop")
+def create_shop(request: Request, body: CreateShopIn):
+    require_role(request, "super_admin")
+    if not body.shop_name or not body.owner_username or not body.owner_password:
+        raise HTTPException(400, "shop_name / owner_username / owner_password 均为必填")
+    conn = get_conn()
+    # 生成唯一 slug（若重名则追加序号）
+    base = slugify(body.shop_name)
+    slug = base
+    i = 1
+    while conn.execute("SELECT id FROM shops WHERE slug = ?", (slug,)).fetchone():
+        slug = f"{base}-{i}"
+        i += 1
+    # 老板用户名也必须唯一
+    if conn.execute("SELECT id FROM users WHERE username = ?", (body.owner_username,)).fetchone():
+        conn.close()
+        raise HTTPException(400, "该店主用户名已被占用，请换一个")
+    created = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO shops(name, slug, created_at) VALUES (?, ?, ?)",
+        (body.shop_name, slug, created),
+    )
+    sid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO users(shop_id, username, password_hash, role, created_at) "
+        "VALUES (?, ?, ?, 'shop_owner', ?)",
+        (sid, body.owner_username, hash_password(body.owner_password), created),
+    )
+    conn.commit()
+    conn.close()
+    base_url = os.getenv("PUBLIC_URL", "http://localhost:8000")
+    return {
+        "shop_id": sid,
+        "name": body.shop_name,
+        "slug": slug,
+        "owner_username": body.owner_username,
+        "owner_password": body.owner_password,  # 仅在创建时明文回显一次，方便交给老板
+        "booking_url": f"{base_url}/book/{slug}",
+        "qr_url": f"{base_url}/api/book/{slug}/qr",
+    }
+
+
+@app.get("/api/super-admin/shops")
+def list_shops(request: Request):
+    require_role(request, "super_admin")
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT sh.id, sh.name, sh.slug, sh.created_at, "
+        "  (SELECT username FROM users WHERE shop_id = sh.id AND role='shop_owner' LIMIT 1) AS owner, "
+        "  (SELECT COUNT(*) FROM bookings b WHERE b.shop_id = sh.id) AS bookings_count "
+        "FROM shops sh ORDER BY sh.id"
+    ).fetchall()
+    conn.close()
+    base_url = os.getenv("PUBLIC_URL", "http://localhost:8000")
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["booking_url"] = f"{base_url}/book/{r['slug']}"
+        d["qr_url"] = f"{base_url}/api/book/{r['slug']}/qr"
+        out.append(d)
+    return out
+
+
+# ---------- 首次运行：种入演示店铺（方便立刻体验） ----------
+def seed_demo_shop():
+    conn = get_conn()
+    if conn.execute("SELECT id FROM shops LIMIT 1").fetchone():
+        conn.close()
+        return
+    created = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO shops(name, slug, created_at) VALUES (?, ?, ?)",
+        ("Demo Barber", "demo", created),
+    )
+    sid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO users(shop_id, username, password_hash, role, created_at) "
+        "VALUES (?, ?, ?, 'shop_owner', ?)",
+        (sid, "admin", hash_password("admin123"), created),
+    )
+    conn.execute(
+        "INSERT INTO services(shop_id, name, duration_min, price) VALUES (?, 'Haircut', 30, 30)",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- 友好 404 页面（仅对网页/非 API 请求返回 HTML，避免裸 JSON） ----------
+FRIENDLY_404 = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Page not found</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#f5f5f7;color:#1d1d1f;margin:0;display:flex;min-height:100vh;align-items:center;
+justify-content:center;text-align:center;padding:24px}
+.card{background:#fff;border-radius:18px;padding:32px 28px;max-width:420px;
+box-shadow:0 8px 24px rgba(20,30,60,.08)}
+h1{font-size:22px;margin:0 0 8px}
+p{color:#6e6e73;font-size:15px;margin:0 0 18px}
+a{display:inline-block;background:#0071e3;color:#fff;text-decoration:none;
+font-weight:600;padding:12px 20px;border-radius:12px}</style></head>
+<body><div class="card"><h1>Page not found</h1>
+<p>The page you’re looking for doesn’t exist or the booking link is invalid.</p>
+<a href="/">Go to homepage</a></div></body></html>"""
+
+
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if exc.status_code == 404 and not request.url.path.startswith("/api/"):
+        return HTMLResponse(content=FRIENDLY_404, status_code=404)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+# ---------- 后台定时任务：自动标记失约 + T-24h 提醒（免费）----------
+def run_reminders():
+    now = datetime.now(timezone.utc)
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT b.id, s.name, b.start_utc, b.customer_name, b.customer_phone, "
+            "b.customer_email, b.reminded_24h FROM bookings b "
+            "JOIN services s ON s.id = b.service_id WHERE b.status = 'pending'"
+        ).fetchall()
+        for r in rows:
+            try:
+                start = datetime.fromisoformat(r["start_utc"])
+                if now > start + timedelta(minutes=15):
+                    conn.execute("UPDATE bookings SET status = 'no_show' WHERE id = ?", (r["id"],))
+                    continue
+                if not r["reminded_24h"] and (start - now) <= timedelta(hours=24) and start > now:
+                    when = start.astimezone(SHOP_TZ).strftime("%Y-%m-%d %H:%M")
+                    # 给老板的提醒
+                    send_email(
+                        os.getenv("SHOP_EMAIL", ""),
+                        f"提醒：{r['name']} 预约",
+                        f"顾客 {r['customer_name'] or r['customer_phone']} 预约于 {when}",
+                    )
+                    # 给顾客的提醒（配置了 SMTP 才真正发送）
+                    if r["customer_email"]:
+                        send_email(
+                            r["customer_email"],
+                            f"预约提醒 · {r['name']}",
+                            f"Kia ora {r['customer_name'] or ''}, reminder: your {r['name']} "
+                            f"appointment is on {when} (Auckland time).",
+                        )
+                    conn.execute("UPDATE bookings SET reminded_24h = 1 WHERE id = ?", (r["id"],))
+            except Exception as e:
+                # 单行处理失败不应中断整批提醒；记录后继续
+                print(f"[scheduler] 处理预约 {r['id']} 失败: {e}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scheduler_loop():
+    while True:
+        try:
+            run_reminders()
+        except Exception as e:
+            print("scheduler error:", e)
+        time.sleep(30)
+
+
+# 托管前端静态文件（同一个免费服务里同时跑 API 和网页）
+app.mount(
+    "/",
+    StaticFiles(directory=STATIC_DIR, html=True),
+    name="static",
+)
+
+
+if __name__ == "__main__":
+    # 部署到 Render / Fly / Koyeb 等平台时读取平台分配的端口；本地默认 8000
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

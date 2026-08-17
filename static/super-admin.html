@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Platform console · Super Admin</title>
+  <script src="/vendor/vue.global.prod.js"></script>
+  <style>
+    :root {
+      --blue: #0071e3; --ink: #1d1d1f; --sub: #6e6e73; --bg: #f5f5f7;
+      --card: #fff; --line: #e6e6ea; --green: #1faa59; --red: #d23b3b;
+      --radius: 16px;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+             "Helvetica Neue", Arial, sans-serif;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: var(--bg); color: var(--ink); }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+
+    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+    .topbar h1 { font-size: 22px; letter-spacing: -.01em; margin: 0; }
+    .topbar .sub { color: var(--sub); font-size: 13px; }
+    .btn { border: none; background: var(--blue); color: #fff; font-size: 15px;
+           font-weight: 600; padding: 11px 18px; border-radius: 12px; cursor: pointer;
+           transition: transform .12s ease, background .2s, opacity .2s; }
+    .btn:active { transform: scale(.97); background: #005bbd; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn.ghost { background: #ececf0; color: var(--ink); }
+    .btn.ghost:active { background: #e0e0e5; }
+    .btn.sm { padding: 7px 12px; font-size: 13px; border-radius: 10px; }
+
+    .card { background: var(--card); border-radius: var(--radius); padding: 18px; margin-bottom: 16px;
+            box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(20,30,60,.06); }
+    .label { font-size: 13px; font-weight: 600; color: var(--sub); text-transform: uppercase;
+             letter-spacing: .04em; margin: 0 0 14px; }
+
+    .login { max-width: 380px; margin: 14vh auto 0; }
+    .login h1 { text-align: center; font-size: 24px; margin-bottom: 4px; }
+    .login .sub { text-align: center; color: var(--sub); margin-bottom: 16px; }
+    input { width: 100%; padding: 14px; font-size: 16px; border: 1.5px solid var(--line);
+            border-radius: 12px; margin: 6px 0; background: #fbfbfd; transition: border-color .2s; }
+    input:focus { outline: none; border-color: var(--blue); }
+    .err { color: var(--red); font-size: 13px; margin-top: 4px; }
+    .note { color: var(--sub); font-size: 13px; line-height: 1.5; }
+    .note a { color: var(--blue); text-decoration: none; font-weight: 600; }
+
+    .form3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    @media (max-width: 620px) { .form3 { grid-template-columns: 1fr; } }
+    .form3 input { margin: 0; }
+
+    .result { margin-top: 14px; background: #f0f7ff; border-radius: 12px; padding: 14px; font-size: 14px; line-height: 1.8; }
+    .result .k { color: var(--sub); display: inline-block; min-width: 110px; }
+    .result .v { font-weight: 600; }
+    .result .ok { color: var(--green); font-weight: 700; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 12px 8px; border-bottom: 1px solid #f0f0f3; vertical-align: middle; }
+    th { color: var(--sub); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .qr { width: 84px; height: 84px; border-radius: 8px; border: 1px solid var(--line); }
+    .shopurl { color: var(--blue); font-weight: 600; word-break: break-all; }
+    .pill { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 20px;
+            background: #e3f0ff; color: #1565c0; }
+    .muted { color: var(--sub); text-align: center; padding: 18px 0; }
+    code { background: #ececf0; padding: 2px 6px; border-radius: 6px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div id="app" class="wrap">
+    <transition name="fade" mode="out-in">
+      <!-- LOGIN -->
+      <div v-if="!token" class="card login" key="login">
+        <h1>Platform Console</h1>
+        <div class="sub">Super Admin sign-in</div>
+        <input type="password" v-model="password" placeholder="Super admin password"
+               @keyup.enter="login" />
+        <div class="err" v-if="loginErr">{{ loginErr }}</div>
+        <button class="btn" style="width:100%;margin-top:8px" @click="login">Sign in</button>
+      </div>
+
+      <!-- CONSOLE -->
+      <div v-else key="console">
+        <div class="topbar">
+          <div>
+            <h1>Platform Console</h1>
+            <div class="sub">Create &amp; manage shops</div>
+          </div>
+          <button class="btn ghost sm" @click="logout">Sign out</button>
+        </div>
+
+        <!-- Create shop -->
+        <div class="card">
+          <p class="label">Create a new shop</p>
+          <div class="form3">
+            <input v-model="form.shop_name" placeholder="Shop name (e.g. Browns Bay Barber)" />
+            <input v-model="form.owner_username" placeholder="Owner username" />
+            <input v-model="form.owner_password" type="text" placeholder="Initial password" />
+          </div>
+          <button class="btn" style="margin-top:12px" :disabled="creating || !form.shop_name"
+                  @click="createShop">
+            {{ creating ? 'Creating…' : 'Create shop & owner account' }}
+          </button>
+          <div class="err" v-if="createErr">{{ createErr }}</div>
+          <div class="result" v-if="created">
+            <div><span class="k">Shop</span><span class="v">{{ created.name }}</span></div>
+            <div><span class="k">Slug</span><span class="v">{{ created.slug }}</span></div>
+            <div><span class="k">Owner login</span><span class="v">{{ created.owner_username }} / {{ created.owner_password }}</span></div>
+            <div><span class="k">Booking URL</span><span class="v shopurl">{{ created.booking_url }}</span></div>
+            <div class="ok" style="margin-top:6px">✓ 账号已创建，把上面用户名/密码交给老板即可。</div>
+          </div>
+        </div>
+
+        <!-- List shops -->
+        <div class="card">
+          <p class="label">All shops ({{ shops.length }})</p>
+          <table>
+            <thead><tr><th>Shop</th><th>Owner</th><th>Bookings</th><th>Booking link</th><th>QR</th></tr></thead>
+            <tbody>
+              <tr v-for="s in shops" :key="s.id">
+                <td><b>{{ s.name }}</b><br><span class="pill">/book/{{ s.slug }}</span></td>
+                <td>{{ s.owner || '—' }}</td>
+                <td>{{ s.bookings_count }}</td>
+                <td><a class="shopurl" :href="s.booking_url" target="_blank">{{ s.booking_url }}</a></td>
+                <td><a :href="s.qr_url" target="_blank"><img class="qr" :src="s.qr_url" :alt="s.slug+' qr'"></a></td>
+              </tr>
+              <tr v-if="shops.length===0"><td colspan="5" class="muted">No shops yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="note">
+          老板后台入口：<a href="/admin.html">/admin.html</a>（用上面生成的用户名/密码登录）。
+          部署前请在 <code>.env</code> 设置强随机的 <code>SUPER_ADMIN_PASSWORD</code> 与 <code>SECRET_KEY</code>。
+        </div>
+      </div>
+    </transition>
+  </div>
+
+  <script>
+    const { createApp, ref, onMounted } = Vue;
+    const TOKEN_KEY = 'booking_super_token';
+
+    createApp({
+      setup() {
+        const token = ref(localStorage.getItem(TOKEN_KEY) || '');
+        const password = ref('');
+        const loginErr = ref('');
+        const form = ref({ shop_name: '', owner_username: '', owner_password: '' });
+        const creating = ref(false);
+        const createErr = ref('');
+        const created = ref(null);
+        const shops = ref([]);
+
+        function auth() { return { headers: { 'Authorization': 'Bearer ' + token.value } }; }
+        async function login() {
+          const r = await fetch('/api/super-admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: password.value })
+          });
+          if (r.ok) { const d = await r.json(); token.value = d.token;
+            localStorage.setItem(TOKEN_KEY, d.token); loginErr.value=''; loadShops(); }
+          else loginErr.value = 'Wrong password.';
+        }
+        function logout() { token.value=''; localStorage.removeItem(TOKEN_KEY); }
+        async function loadShops() {
+          const r = await fetch('/api/super-admin/shops', auth());
+          if (r.status === 401) return logout();
+          shops.value = await r.json();
+        }
+        async function createShop() {
+          if (!form.value.shop_name || !form.value.owner_username || !form.value.owner_password) {
+            createErr.value = '三项都要填。'; return;
+          }
+          creating.value = true; createErr.value=''; created.value=null;
+          try {
+            const r = await fetch('/api/super-admin/create-shop', {
+              method: 'POST',
+              headers: { ...auth().headers, 'Content-Type': 'application/json' },
+              body: JSON.stringify(form.value)
+            });
+            const d = await r.json();
+            if (r.ok) {
+              created.value = d;
+              form.value = { shop_name:'', owner_username:'', owner_password:'' };
+              loadShops();
+            } else { createErr.value = d.detail || '创建失败'; }
+          } catch (e) { createErr.value = '网络错误，请重试'; }
+          finally { creating.value = false; }
+        }
+        onMounted(() => { if (token.value) loadShops(); });
+        return { token, password, loginErr, form, creating, createErr, created, shops,
+                 login, logout, loadShops, createShop };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
