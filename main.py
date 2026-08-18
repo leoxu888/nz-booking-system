@@ -731,7 +731,7 @@ def _resolve_service(text: str, shop_id: int):
     """在「本店」已有服务中匹配；匹配不到再用保守关键词映射。"""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT name FROM services WHERE shop_id = ?", (shop_id,)
+        "SELECT name FROM services WHERE shop_id = ? AND (active IS NULL OR active = 1)", (shop_id,)
     ).fetchall()
     conn.close()
     tl = text.lower()
@@ -809,7 +809,7 @@ def _match_or_create_service(conn, name, price, shop_id):
         return None, None, False
     tl = name.lower()
     rows = conn.execute(
-        "SELECT id, name FROM services WHERE shop_id = ?", (shop_id,)
+        "SELECT id, name FROM services WHERE shop_id = ? AND (active IS NULL OR active = 1)", (shop_id,)
     ).fetchall()
     for r in rows:
         rn = r["name"].lower()
@@ -902,7 +902,8 @@ def customer_services(slug: str):
         return cached
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, name, duration_min, price FROM services WHERE shop_id = ? ORDER BY id",
+        "SELECT id, name, duration_min, price FROM services "
+        "WHERE shop_id = ? AND (active IS NULL OR active = 1) ORDER BY id",
         (s["id"],),
     ).fetchall()
     conn.close()
@@ -1599,7 +1600,8 @@ def admin_services(request: Request):
     u = get_current_user(request)
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, name, duration_min, price FROM services WHERE shop_id = ? ORDER BY id",
+        "SELECT id, name, duration_min, price FROM services "
+        "WHERE shop_id = ? AND (active IS NULL OR active = 1) ORDER BY id",
         (u["shop_id"],),
     ).fetchall()
     conn.close()
@@ -1622,24 +1624,33 @@ def add_service(request: Request, body: ServiceIn):
 
 @app.delete("/api/admin/services/{sid}")
 def delete_service(request: Request, sid: int):
+    """删除服务 = 软删除（active=0）：服务从顾客端与后台列表消失，
+    但历史预约仍保留（JOIN 仍能显示服务名），关联的 pending/confirmed
+    预约自动置为 cancelled 释放档期。避免 Postgres 外键导致无法删除。"""
     u = get_current_user(request)
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT id, name FROM services WHERE id = ? AND shop_id = ?", (sid, u["shop_id"])
+            "SELECT id, name FROM services WHERE id = ? AND shop_id = ? "
+            "AND (active IS NULL OR active = 1)", (sid, u["shop_id"])
         ).fetchone()
         if not row:
             raise HTTPException(404, "service not found")
-        # 如果该服务仍有预约：自动取消所有关联预约（保留历史记录，状态=已取消）。
-        # 这样老板可放心删除服务，不必手动一个个 cancel 预约。
-        affected = conn.execute(
+        # 自动取消所有未完成的关联预约（保留 cancelled 历史记录）
+        conn.execute(
             "UPDATE bookings SET status = 'cancelled' "
             "WHERE service_id = ? AND shop_id = ? "
             "  AND status IN ('pending','confirmed')",
             (sid, u["shop_id"])
         )
-        cancelled_count = affected.rowcount if hasattr(affected, "rowcount") else 0
-        conn.execute("DELETE FROM services WHERE id = ?", (sid,))
+        # 计数取消了几条（rowcount 在 _PGConn 包装下可能不可用，兜底查询）
+        cancelled_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM bookings WHERE service_id = ? "
+            "AND shop_id = ? AND status = 'cancelled'",
+            (sid, u["shop_id"])
+        ).fetchone()["c"]
+        # 软删除：active=0
+        conn.execute("UPDATE services SET active = 0 WHERE id = ?", (sid,))
         conn.commit()
     except HTTPException:
         conn.rollback()

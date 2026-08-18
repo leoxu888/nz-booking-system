@@ -416,6 +416,8 @@ def init_db():
         _add_column(conn, "bookings", "confirmation_error", "TEXT")
         # 店铺启用状态：0=停用（顾客端不可访问），1=启用；默认启用
         _add_column(conn, "shops", "active", "INTEGER DEFAULT 1")
+        # 服务启用状态：0=已删除（软删除，历史预约仍保留），1=正常；默认正常
+        _add_column(conn, "services", "active", "INTEGER DEFAULT 1")
         # JWT 强制失效机制：token_version 每次改密/登出/超管重置时自增，
         # 旧 Token 携带的版本号与库中不一致 → 立即 401。默认 1，已有行回填 1。
         _add_column(conn, "users", "token_version", "INTEGER DEFAULT 1")
