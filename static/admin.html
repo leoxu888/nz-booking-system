@@ -67,10 +67,12 @@
     .closed-cell { text-align: center; }
     .closed-cell input { width: auto; margin: 0; }
 
-    .bk { padding: 12px 4px; border-bottom: 1px solid #f0f0f3; }
-    .bk:last-child { border-bottom: none; }
-    .bk .head { display: flex; align-items: center; gap: 12px; }
-    .bk .time { font-size: 18px; font-weight: 700; width: 64px; flex: 0 0 auto; letter-spacing: -.01em; }
+    .bk { padding: 14px 16px; margin: 8px -4px; border-radius: 12px;
+         border: 1px solid transparent; transition: background .15s, border-color .15s; }
+    .bk:hover { background: #fafafd; border-color: var(--line); }
+    .bk .head { display: flex; align-items: center; gap: 14px; }
+    .bk .time { font-size: 17px; font-weight: 700; width: 56px; flex: 0 0 auto;
+                color: var(--ink); letter-spacing: -.01em; }
     .bk .info { flex: 1; min-width: 0; }
     .bk .info .svc { font-weight: 600; }
     .bk .info .ph { color: var(--sub); font-size: 13px; }
@@ -80,16 +82,34 @@
     .done { background: #e7f7ee; color: var(--green); }
     .no_show { background: #fdeaea; color: var(--red); }
     .cancelled { background: #efefef; color: #8a8a8e; }
-    .acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+    .acts { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+            margin-top: 12px; padding-top: 10px; border-top: 1px dashed #ececf0; }
+    .acts .sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
     .statusbtn { border: 1.5px solid var(--line); background: #fff; color: var(--sub);
-                 font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 20px;
+                 font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: 16px;
                  cursor: pointer; transition: all .15s; }
+    .statusbtn:hover { border-color: var(--blue); color: var(--blue); }
     .statusbtn.on { border-color: var(--blue); background: #eff5ff; color: var(--blue); }
     .muted { color: var(--sub); text-align: center; padding: 18px 0; }
 
-    .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
-    .filters input { margin: 0; flex: 1; min-width: 120px; }
-    .filters .q { flex: 2; min-width: 140px; }
+    /* Filter bar — 日期段 + 搜索 + 快捷按钮的紧凑布局 */
+    .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+               margin-bottom: 14px; padding: 10px 12px; background: #fafafd;
+               border-radius: 12px; }
+    .filters .range { display: flex; align-items: center; gap: 6px;
+                      background: #fff; border: 1.5px solid var(--line);
+                      border-radius: 10px; padding: 2px 6px; }
+    .filters .range input { width: 130px; border: none; background: transparent;
+                            padding: 6px 4px; margin: 0; font-size: 14px; }
+    .filters .range input:focus { outline: none; }
+    .filters .range .dash { color: var(--sub); font-weight: 600; }
+    .filters .q { flex: 1; min-width: 160px; }
+    .filters .quick { display: flex; gap: 4px; }
+    .filters .quick button { font-size: 12px; font-weight: 600; padding: 6px 10px;
+                             border: 1.5px solid var(--line); background: #fff;
+                             color: var(--sub); border-radius: 8px; cursor: pointer; }
+    .filters .quick button:hover { color: var(--blue); border-color: var(--blue); }
+    .filters .quick button.active { background: var(--blue); color: #fff; border-color: var(--blue); }
 
     .resched { background: #f7f9ff; border: 1px solid var(--line); border-radius: 12px;
                padding: 10px 12px; margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -288,12 +308,19 @@
         <div class="card">
           <p class="label">Schedule</p>
           <div class="filters">
-            <input type="date" v-model="fromDate" @change="loadBookings" />
-            <span class="hint" style="margin:0">to</span>
-            <input type="date" v-model="toDate" @change="loadBookings" />
-            <input class="q" type="text" v-model="searchQ" placeholder="Search name / email"
+            <div class="range">
+              <input type="date" v-model="fromDate" @change="loadBookings; updateQuick()" />
+              <span class="dash">–</span>
+              <input type="date" v-model="toDate" @change="loadBookings; updateQuick()" />
+            </div>
+            <input class="q" type="text" v-model="searchQ" placeholder="🔍  Search name or email"
                    @input="loadBookings" />
-            <button class="btn ghost sm" @click="setToday">Today</button>
+            <div class="quick">
+              <button :class="{active: quickRange==='today'}" @click="setRange('today')">Today</button>
+              <button :class="{active: quickRange==='tomorrow'}" @click="setRange('tomorrow')">Tomorrow</button>
+              <button :class="{active: quickRange==='7d'}" @click="setRange('7d')">Next 7d</button>
+              <button :class="{active: quickRange==='30d'}" @click="setRange('30d')">Next 30d</button>
+            </div>
           </div>
           <div v-if="bookings.length===0" class="muted">No bookings in this range.</div>
           <div v-for="b in bookings" :key="b.id" class="bk">
@@ -316,6 +343,7 @@
             <div class="acts">
               <button class="statusbtn" v-for="st in statuses" :key="st"
                       :class="{on: b.status===st}" @click="setStatus(b.id, st)">{{ label(st) }}</button>
+              <span class="sep"></span>
               <button class="btn sm" @click="openResched(b)">Reschedule</button>
               <button class="btn sm danger" @click="cancelBooking(b.id)">Cancel &amp; Notify</button>
             </div>
@@ -563,7 +591,38 @@
         function setToday() {
           fromDate.value = localDateStr(new Date());
           toDate.value = localDateStr(new Date());
+          quickRange.value = 'today';
           loadBookings();
+        }
+        const quickRange = ref('');  // 当前选中的快捷范围（'today'/'tomorrow'/'7d'/'30d'/''）
+        function setRange(kind) {
+          const t = new Date();
+          if (kind === 'today') {
+            fromDate.value = localDateStr(t);
+            toDate.value = localDateStr(t);
+          } else if (kind === 'tomorrow') {
+            const t2 = addDays(t, 1);
+            fromDate.value = localDateStr(t2);
+            toDate.value = localDateStr(t2);
+          } else if (kind === '7d') {
+            fromDate.value = localDateStr(t);
+            toDate.value = localDateStr(addDays(t, 6));
+          } else if (kind === '30d') {
+            fromDate.value = localDateStr(t);
+            toDate.value = localDateStr(addDays(t, 29));
+          }
+          quickRange.value = kind;
+          loadBookings();
+        }
+        function updateQuick() {
+          // 用户手动改 date input 时，清掉快捷按钮高亮
+          const today = localDateStr(new Date());
+          const tom = localDateStr(addDays(new Date(), 1));
+          if (fromDate.value === today && toDate.value === today) quickRange.value = 'today';
+          else if (fromDate.value === tom && toDate.value === tom) quickRange.value = 'tomorrow';
+          else if (fromDate.value === today && toDate.value === localDateStr(addDays(new Date(), 6))) quickRange.value = '7d';
+          else if (fromDate.value === today && toDate.value === localDateStr(addDays(new Date(), 29))) quickRange.value = '30d';
+          else quickRange.value = '';
         }
         async function setStatus(id, st) {
           await fetch('/api/admin/bookings/' + id, {
@@ -666,7 +725,7 @@
         }
         onMounted(() => { if (token.value) loadAll(); });
         return { token, shop, username, password, loginErr, bookings, services, newSvc,
-                 login, logout, setToday, setStatus, openResched, saveResched, cancelBooking,
+                 login, logout, setToday, setRange, updateQuick, quickRange, setStatus, openResched, saveResched, cancelBooking,
                  addService, delService, maskPhone, label, fmtLocal,
                  flash,
                  aiText, aiLoading, aiMsg, aiOk, aiResult, aiParse,
