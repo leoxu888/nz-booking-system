@@ -1626,25 +1626,31 @@ def delete_service(request: Request, sid: int):
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT id FROM services WHERE id = ? AND shop_id = ?", (sid, u["shop_id"])
+            "SELECT id, name FROM services WHERE id = ? AND shop_id = ?", (sid, u["shop_id"])
         ).fetchone()
         if not row:
             raise HTTPException(404, "service not found")
-        # 外键已开启：若该服务仍有预约，直接删除会因外键约束失败。
-        # 主动检测并返回明确错误，避免把预约「静默隐藏」后又被重新挂出来（P1-5）。
-        linked = conn.execute(
-            "SELECT 1 FROM bookings WHERE service_id = ? AND shop_id = ? LIMIT 1",
-            (sid, u["shop_id"]),
-        ).fetchone()
-        if linked:
-            raise HTTPException(409,
-                "该服务仍有历史预约，无法删除。可先将其从前端隐藏或保留以提供历史记录。")
+        # 如果该服务仍有预约：自动取消所有关联预约（保留历史记录，状态=已取消）。
+        # 这样老板可放心删除服务，不必手动一个个 cancel 预约。
+        affected = conn.execute(
+            "UPDATE bookings SET status = 'cancelled' "
+            "WHERE service_id = ? AND shop_id = ? "
+            "  AND status IN ('pending','confirmed')",
+            (sid, u["shop_id"])
+        )
+        cancelled_count = affected.rowcount if hasattr(affected, "rowcount") else 0
         conn.execute("DELETE FROM services WHERE id = ?", (sid,))
         conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     _cache_set(f"svc:{u['shop_id']}", None)
-    return {"ok": True}
+    return {"ok": True, "cancelled_bookings": cancelled_count}
 
 
 @app.patch("/api/admin/bookings/{bid}")
@@ -1671,10 +1677,46 @@ def update_booking(request: Request, bid: int, body: BookingUpdate):
         except Exception:
             conn.close()
             raise HTTPException(400, "预约时间格式无法解析")
-        # 改期目标时段需可约（排除自己当前占用的 slot；防止把预约改到已被占用的时段）
-        if not _slot_free(u["shop_id"], b["service_id"], start_local):
+        # 时段冲突检查（直接 SQL，避免 generate_slots 把自己当前 slot 当作已占用）
+        # 检查：是否在营业时间内（day_hours 至少有窗口）
+        day = start_local.date()
+        windows = day_hours(shop, day.weekday()) if shop else []
+        if not windows:
             conn.close()
-            raise HTTPException(409, "该时段不可预约（可能已满或已占用）")
+            raise HTTPException(409, "改期失败：所选日期店铺休息（无营业窗口）")
+        # 检查：是否在某个营业窗口内
+        target_min = start_local.hour * 60 + start_local.minute
+        in_window = any(o_h*60+o_m <= target_min and target_min + 30 <= c_h*60+c_m
+                        for (o_h, o_m, c_h, c_m) in windows)
+        if not in_window:
+            conn.close()
+            raise HTTPException(409, "改期失败：所选时间不在营业时间内")
+        # 检查：是否过去（本地时间 vs 当前时间，容忍 1 分钟抖动）
+        if start_local < datetime.now(SHOP_TZ) - timedelta(minutes=1):
+            conn.close()
+            raise HTTPException(409, "改期失败：不能改到过去的时间")
+        # 检查：是否已有其他预约占用（排除自己）
+        conflict = conn.execute(
+            "SELECT 1 FROM bookings WHERE shop_id = ? AND start_utc = ? "
+            "AND status IN ('pending','confirmed') AND id != ? LIMIT 1",
+            (u["shop_id"], start_utc.isoformat(), bid)
+        ).fetchone()
+        if conflict:
+            conn.close()
+            raise HTTPException(409, "改期失败：该时段已被其他预约占用")
+        # 检查：每日容量限制（如有）
+        if shop and shop.get("daily_capacity"):
+            date_str = start_local.date().isoformat()
+            # 跨 DB 兼容：start_utc ISO 字符串以 "YYYY-MM-DD" 开头，按 LIKE 匹配
+            day_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM bookings WHERE shop_id = ? "
+                "AND status IN ('pending','confirmed') AND id != ? "
+                f"AND start_utc LIKE ?",
+                (u["shop_id"], bid, f"{date_str}%")
+            ).fetchone()["c"]
+            if day_count >= shop["daily_capacity"]:
+                conn.close()
+                raise HTTPException(409, f"改期失败：{date_str} 当日预约已达上限 {shop['daily_capacity']}")
         conn.execute("UPDATE bookings SET start_utc = ? WHERE id = ?",
                      (start_utc.isoformat(), bid))
         rescheduled = True

@@ -637,13 +637,22 @@
           reschedTime.value = b.time;
         }
         async function saveResched(b) {
-          const start_local = reschedDate.value + 'T' + reschedTime.value;
-          await fetch('/api/admin/bookings/' + b.id, {
+          const start_local = reschedDate.value + 'T' + reschedTime.value + ':00';
+          const r = await fetch('/api/admin/bookings/' + b.id, {
             method: 'PATCH',
             headers: { ...auth().headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ start_local }) });
-          reschedId.value = null;
-          loadBookings();
+            body: JSON.stringify({ start_local }),
+          });
+          if (r.ok) {
+            flash.value = { type: 'ok', text: '已改期' };
+            reschedId.value = null;
+            reschedDate.value = ''; reschedTime.value = '';
+            loadBookings();
+          } else {
+            const d = await r.json().catch(() => ({}));
+            flash.value = { type: 'err', text: d.detail || '改期失败' };
+            setTimeout(() => { flash.value = null; }, 5000);
+          }
         }
         async function cancelBooking(id) {
           if (!confirm('Cancel this booking and notify the customer?')) return;
@@ -663,22 +672,26 @@
           loadServices();
         }
         async function delService(id) {
-          if (!confirm('Delete this service?')) return;
+          if (!confirm('Delete this service?\n\nFuture/pending/confirmed bookings on this service will be auto-cancelled (history retained). This cannot be undone.')) return;
           const r = await fetch('/api/admin/services/' + id, { method: 'DELETE', ...auth() });
+          const d = await r.json().catch(() => ({}));
           if (r.ok) {
-            flash.value = { type: 'ok', text: '服务已删除' };
+            const n = d.cancelled_bookings || 0;
+            const msg = n > 0
+              ? `服务已删除，${n} 条关联预约已自动取消（保留历史）`
+              : '服务已删除';
+            flash.value = { type: 'ok', text: msg };
             loadServices();
           } else {
-            const d = await r.json().catch(() => ({}));
             flash.value = { type: 'err', text: d.detail || `删除失败 (${r.status})` };
           }
           setTimeout(() => { flash.value = null; }, 5000);
         }
         function maskPhone(p) {
+          // 老板需要给顾客打电话，完整显示手机号；
+          // 之前打码（+64 •••• 4567）的设计过于保守，对用户造成不必要的麻烦。
           if (!p) return '';
-          const d = p.replace(/[^\d]/g, '');
-          const last4 = d.slice(-4);
-          return '+64 •••• ' + last4;
+          return p;
         }
         function label(s) {
           return { pending:'Pending', confirmed:'Confirmed', done:'Done',
