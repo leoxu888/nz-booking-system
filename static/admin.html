@@ -30,6 +30,10 @@
     .btn.ghost { background: #ececf0; color: var(--ink); }
     .btn.ghost:active { background: #e0e0e5; }
     .btn.sm { padding: 7px 12px; font-size: 13px; border-radius: 10px; }
+    .flash { padding: 12px 18px; border-radius: 12px; margin-bottom: 14px;
+             font-size: 14px; font-weight: 500; }
+    .flash.ok { background: #e8f5e9; color: #1b5e20; border: 1px solid #c8e6c9; }
+    .flash.err { background: #ffebee; color: #b71c1c; border: 1px solid #ffcdd2; }
     .btn.danger { background: var(--red); }
     .btn.danger:active { background: #b03030; }
 
@@ -160,6 +164,8 @@
           <div class="url">{{ shop.booking_url }}</div>
           <a class="note" :href="shop.qr_url" target="_blank">Open full-size QR</a>
         </div>
+
+        <div v-if="flash" class="flash" :class="flash.type">{{ flash.text }}</div>
 
         <!-- Business hours (per-weekday, multiple windows) -->
         <div class="card">
@@ -339,6 +345,7 @@
             day = String(d.getDate()).padStart(2,'0');
       return `${y}-${m}-${day}`;
     }
+    function addDays(d, n) { const r = new Date(d); r.setDate(r.getDate()+n); return r; }
 
     createApp({
       setup() {
@@ -372,8 +379,9 @@
         const copied = ref(false);
         const statuses = ['pending', 'confirmed', 'done', 'no_show', 'cancelled'];
         const fromDate = ref(localDateStr(new Date()));
-        const toDate = ref(localDateStr(new Date()));
+        const toDate = ref(localDateStr(addDays(new Date(), 13)));
         const searchQ = ref('');
+        const flash = ref(null); // 顶部反馈横幅：{type:'ok'|'err', text:'...'}
         const reschedId = ref(null);
         const reschedDate = ref('');
         const reschedTime = ref('');
@@ -561,8 +569,15 @@
         }
         async function delService(id) {
           if (!confirm('Delete this service?')) return;
-          await fetch('/api/admin/services/' + id, { method: 'DELETE', ...auth() });
-          loadServices();
+          const r = await fetch('/api/admin/services/' + id, { method: 'DELETE', ...auth() });
+          if (r.ok) {
+            flash.value = { type: 'ok', text: '服务已删除' };
+            loadServices();
+          } else {
+            const d = await r.json().catch(() => ({}));
+            flash.value = { type: 'err', text: d.detail || `删除失败 (${r.status})` };
+          }
+          setTimeout(() => { flash.value = null; }, 5000);
         }
         function maskPhone(p) {
           if (!p) return '';
@@ -617,6 +632,7 @@
         return { token, shop, username, password, loginErr, bookings, services, newSvc,
                  login, logout, setToday, setStatus, openResched, saveResched, cancelBooking,
                  addService, delService, maskPhone, label, fmtLocal,
+                 flash,
                  aiText, aiLoading, aiMsg, aiOk, aiResult, aiParse,
                  weekdayNames, weekdayKeys, hours, slotMinutes, savingHours, hoursMsg,
                  hoursOk, addWindow, removeWindow, saveHours, dailyCapacity,
