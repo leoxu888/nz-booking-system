@@ -167,6 +167,17 @@
 
         <div v-if="flash" class="flash" :class="flash.type">{{ flash.text }}</div>
 
+        <div v-if="emailStatus && !emailStatus.smtp_configured" class="flash err"
+             style="background:#fff3e0;color:#b71c1c;border:1px solid #ffd180">
+          <b>确认邮件未发送。</b> Render 上还没配 SMTP 环境变量（缺 {{ emailStatus.smtp_missing.join(', ') }}），
+          所以顾客的预约确认邮件不会被发出。请到 Render 后台 Environment 添加：
+          <code style="background:#fff;padding:2px 6px;border-radius:4px">SMTP_HOST</code>、
+          <code style="background:#fff;padding:2px 6px;border-radius:4px">SMTP_USER</code>、
+          <code style="background:#fff;padding:2px 6px;border-radius:4px">SMTP_PASS</code>
+          （免费用 Gmail App Password）。
+          <span v-if="emailStatus.unconfirmed_emails">当前已有 {{ emailStatus.unconfirmed_emails }} 条预约确认未发出。</span>
+        </div>
+
         <!-- Business hours (per-weekday, multiple windows) -->
         <div class="card">
           <p class="label">Available hours</p>
@@ -292,6 +303,13 @@
                 <div class="svc">{{ b.service }}</div>
                 <div class="ph">{{ b.date }} · {{ b.name || '—' }} · {{ b.email || maskPhone(b.phone) }}</div>
                 <div class="ph" v-if="b.returning" style="color:var(--blue2);font-weight:600">📌 {{ b.visits }}th visit<span v-if="b.last_service"> · last: {{ b.last_service }}</span></div>
+                <div class="ph" v-if="b.confirmation_sent === 0" style="color:#b71c1c;font-size:12px"
+                     :title="b.confirmation_error || ''">
+                  ✉️ 确认邮件未发{{ b.confirmation_error ? '：' + b.confirmation_error.split('\n')[0] : '' }}
+                </div>
+                <div class="ph" v-else-if="b.confirmation_sent === 1" style="color:#1b5e20;font-size:12px">
+                  ✉️ 确认邮件已发
+                </div>
               </div>
               <span class="tag" :class="b.status">{{ label(b.status) }}</span>
             </div>
@@ -376,6 +394,7 @@
         const exporting = ref(false);
         const exportingCsv = ref(false);
         const stats = ref(null);
+        const emailStatus = ref(null); // SMTP 配了没 + 未确认邮件数
         const copied = ref(false);
         const statuses = ['pending', 'confirmed', 'done', 'no_show', 'cancelled'];
         const fromDate = ref(localDateStr(new Date()));
@@ -441,17 +460,32 @@
         }
         async function addBlackout() {
           if (!newBlackout.value) return;
-          await fetch('/api/admin/blackout', {
+          const r = await fetch('/api/admin/blackout', {
             method: 'POST',
             headers: { ...auth().headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ date: newBlackout.value, note: newBlackoutNote.value || null }),
           });
-          newBlackout.value = ''; newBlackoutNote.value = '';
-          await loadBlackout();
+          if (r.ok) {
+            flash.value = { type: 'ok', text: `已添加关店日 ${newBlackout.value}` };
+            newBlackout.value = ''; newBlackoutNote.value = '';
+            await loadBlackout();
+          } else {
+            const d = await r.json().catch(() => ({}));
+            flash.value = { type: 'err', text: d.detail || `添加失败 (${r.status})` };
+          }
+          setTimeout(() => { flash.value = null; }, 5000);
         }
         async function removeBlackout(date) {
-          await fetch('/api/admin/blackout/' + date, { method: 'DELETE', ...auth() });
-          await loadBlackout();
+          if (!confirm(`Remove blackout on ${date}?`)) return;
+          const r = await fetch('/api/admin/blackout/' + date, { method: 'DELETE', ...auth() });
+          if (r.ok) {
+            flash.value = { type: 'ok', text: `已移除 ${date} 的关店标记` };
+            await loadBlackout();
+          } else {
+            const d = await r.json().catch(() => ({}));
+            flash.value = { type: 'err', text: d.detail || `删除失败 (${r.status})` };
+          }
+          setTimeout(() => { flash.value = null; }, 5000);
         }
         async function loadBlackout() {
           try {
@@ -498,7 +532,9 @@
           try {
             const d = await (await fetch('/api/admin/stats', auth())).json();
             stats.value = d;
-          } catch (e) {}
+            const e = await (await fetch('/api/admin/email-status', auth())).json();
+            emailStatus.value = e;
+          } catch (err) {}
         }
         async function login() {
           const r = await fetch('/api/admin/login', {
@@ -638,6 +674,7 @@
                  hoursOk, addWindow, removeWindow, saveHours, dailyCapacity,
                  blackouts, newBlackout, newBlackoutNote, addBlackout, removeBlackout,
                  exporting, exportingCsv, exportCsv, copied, exportIcs, copyCal, stats,
+                 emailStatus,
                  statuses, fromDate, toDate, searchQ };
       }
     }).mount('#app');

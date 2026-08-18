@@ -452,13 +452,14 @@ def email_booking_confirmation(slug, shop_name, items):
     """预约成功后：给客户发确认邮件（支持单次或循环系列）。
     items: 列表，每项 {service_name, name, email, start_local_dt, end_local_dt,
                        manage_url, ics_url, gcal_url}
+    Returns (success, error_msg) 方便调用方把发送状态写回 DB。
     """
     if not items:
-        return
+        return True, None
     name = items[0]["name"]
     email = items[0]["email"]
     if not email:
-        return
+        return False, "顾客未填邮箱"
     if len(items) == 1:
         it = items[0]
         when = it["start_local_dt"].strftime("%A %d %B %Y %H:%M")
@@ -473,7 +474,7 @@ def email_booking_confirmation(slug, shop_name, items):
             f"  {it['manage_url']}\n\n"
             f"We'll send a reminder 24h before. See you soon!"
         )
-        send_email(email, f"Booking confirmed · {shop_name}", body)
+        return send_email(email, f"Booking confirmed · {shop_name}", body)
     else:
         lines = [f"Kia ora {name},\n\n"
                  f"You're booked for {len(items)} weekly sessions at {shop_name}:\n"]
@@ -484,8 +485,8 @@ def email_booking_confirmation(slug, shop_name, items):
                 f"     Manage: {it['manage_url']}\n"
                 f"     Calendar: {it['gcal_url']}\n")
         lines.append("\nWe'll send a reminder 24h before each session. See you soon!")
-        send_email(email, f"{len(items)} bookings confirmed · {shop_name}",
-                   "\n".join(lines))
+        return send_email(email, f"{len(items)} bookings confirmed · {shop_name}",
+                          "\n".join(lines))
 
 
 _STATUS_EMAILS = {
@@ -1017,7 +1018,18 @@ def customer_create_booking(request: Request, slug: str, body: BookingIn):
         # 给顾客发确认邮件（含每单的自助管理链接）
         items = [_email_item(slug, bid, s["name"], svc["name"], name, email, sl, sl_end, tok)
                  for (bid, sl, sl_end, tok) in created]
-        email_booking_confirmation(slug, s["name"], items)
+        # 邮件发送是 fire-and-forget，但要把结果写回 DB（方便老板后台/顾客管理页面追踪）。
+        # send_email 现在返回 (success, error_msg)。
+        email_ok, email_err = email_booking_confirmation(slug, s["name"], items)
+        for (bid, _, _, _) in created:
+            try:
+                conn.execute(
+                    "UPDATE bookings SET confirmation_sent = ?, confirmation_error = ? WHERE id = ?",
+                    (1 if email_ok else 0, email_err, bid),
+                )
+            except Exception:
+                pass  # 不影响预约主流程
+        conn.commit()
 
         first = created[0]
         return {
@@ -1028,6 +1040,8 @@ def customer_create_booking(request: Request, slug: str, body: BookingIn):
             "customer_email": email,
             "manage_token": first[3],
             "manage_url": f"/manage/{slug}/{first[3]}",
+            "confirmation_sent": email_ok,
+            "confirmation_error": email_err,
             "series": [{"id": bid, "start_local": sl.isoformat(), "service": svc["name"],
                         "manage_token": tok, "manage_url": f"/manage/{slug}/{tok}"}
                        for (bid, sl, _, tok) in created],
@@ -1411,8 +1425,8 @@ def admin_bookings(request: Request, date: str = None,
     conn = get_conn()
     rows = conn.execute(
         "SELECT b.id, s.name, b.customer_name, b.customer_email, b.customer_phone, "
-        "b.start_utc, b.status FROM bookings b "
-        "JOIN services s ON s.id = b.service_id "
+        "b.start_utc, b.status, b.confirmation_sent, b.confirmation_error "
+        "FROM bookings b JOIN services s ON s.id = b.service_id "
         "WHERE b.shop_id = ? ORDER BY b.start_utc",
         (u["shop_id"],),
     ).fetchall()
@@ -1457,6 +1471,8 @@ def admin_bookings(request: Request, date: str = None,
             "visits": visits,
             "returning": visits > 1,
             "last_service": prior,
+            "confirmation_sent": (r["confirmation_sent"] if "confirmation_sent" in r.keys() else 0),
+            "confirmation_error": (r["confirmation_error"] if "confirmation_error" in r.keys() else None),
         })
     return out
 
@@ -1529,6 +1545,42 @@ def admin_stats(request: Request):
         "no_show_rate": no_show_rate,
         "week_no_show": week_no_show,
         "week_no_show_rate": week_rate,
+    }
+
+
+@app.get("/api/admin/email-status")
+def admin_email_status(request: Request):
+    """老板诊断：SMTP 配了没 + 多少条预约的确认邮件没发出。"""
+    u = get_current_user(request)
+    conn = get_conn()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) AS c FROM bookings WHERE shop_id = ?", (u["shop_id"],)
+        ).fetchone()["c"]
+        unconfirmed = conn.execute(
+            "SELECT COUNT(*) AS c FROM bookings WHERE shop_id = ? AND confirmation_sent = 0",
+            (u["shop_id"],)
+        ).fetchone()["c"]
+        sample_err = conn.execute(
+            "SELECT confirmation_error FROM bookings WHERE shop_id = ? "
+            "AND confirmation_sent = 0 AND confirmation_error IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1", (u["shop_id"],)
+        ).fetchone()
+    finally:
+        conn.close()
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+    missing = []
+    if not smtp_host: missing.append("SMTP_HOST")
+    if not smtp_user: missing.append("SMTP_USER")
+    if not smtp_pass: missing.append("SMTP_PASS")
+    return {
+        "smtp_configured": not missing,
+        "smtp_missing": missing,
+        "total_bookings": total,
+        "unconfirmed_emails": unconfirmed,
+        "sample_error": (sample_err["confirmation_error"] if sample_err else None),
     }
 
 

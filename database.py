@@ -411,6 +411,9 @@ def init_db():
         _add_column(conn, "bookings", "customer_email", "TEXT")
         _add_column(conn, "shops", "daily_capacity", "INTEGER")
         _add_column(conn, "bookings", "manage_token", "TEXT")
+        # 确认邮件发送状态：0=未发/失败（默认），1=已发；发送失败时记录错误
+        _add_column(conn, "bookings", "confirmation_sent", "INTEGER DEFAULT 0")
+        _add_column(conn, "bookings", "confirmation_error", "TEXT")
         # 店铺启用状态：0=停用（顾客端不可访问），1=启用；默认启用
         _add_column(conn, "shops", "active", "INTEGER DEFAULT 1")
         # JWT 强制失效机制：token_version 每次改密/登出/超管重置时自增，
