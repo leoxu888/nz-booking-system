@@ -1296,6 +1296,16 @@ def admin_logout(request: Request):
     return {"ok": True, "message": "已登出，所有会话已失效"}
 
 
+@app.get("/healthz")
+def healthz():
+    """Liveness check for uptime monitoring (UptimeRobot / Render).
+    Returns 200 OK regardless of shop/business data state — only fails if the
+    Python process is dead or event loop is hung. Use this URL for health
+    monitoring instead of business endpoints like /api/book/{slug}/shop
+    (which can legitimately 404 if the demo shop is removed)."""
+    return {"status": "ok", "ts": time.time()}
+
+
 @app.get("/api/admin/shop")
 def admin_shop_info(request: Request):
     u = get_current_user(request)
