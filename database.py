@@ -413,6 +413,12 @@ def init_db():
         _add_column(conn, "bookings", "manage_token", "TEXT")
         # 店铺启用状态：0=停用（顾客端不可访问），1=启用；默认启用
         _add_column(conn, "shops", "active", "INTEGER DEFAULT 1")
+        # JWT 强制失效机制：token_version 每次改密/登出/超管重置时自增，
+        # 旧 Token 携带的版本号与库中不一致 → 立即 401。默认 1，已有行回填 1。
+        _add_column(conn, "users", "token_version", "INTEGER DEFAULT 1")
+        # JWT 强制失效机制：token_version 每次改密/登出/超管重置时自增，
+        # 旧 Token 携带的版本号与库中不一致 → 立即 401。默认 1，已有行回填 1。
+        _add_column(conn, "users", "token_version", "INTEGER DEFAULT 1")
         # 关键约束：同一小店同一 UTC 时段只允许一条「有效」预约，从数据库层杜绝重复售卖。
         # 用「部分唯一索引」只覆盖有效状态(pending/confirmed)；取消/完成/失约的时段
         # 视为已释放，可重新预约（与 _slot_free / occupied_intervals 的逻辑一致）。
@@ -508,5 +514,33 @@ def seed_demo_shop():
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+# ---------- JWT Token 强制失效：token_version 读写 ----------
+def get_user_token_version(user_id: int) -> int:
+    """查询用户当前 token_version；不存在或为 NULL 时按 1 处理（平滑迁移旧数据）。"""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or row["token_version"] is None:
+        return 1
+    return int(row["token_version"])
+
+
+def increment_user_token_version(user_id: int) -> None:
+    """把用户 token_version 自增 1 → 此前签发的所有 JWT 立即失效。"""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE users SET token_version = COALESCE(token_version, 1) + 1 WHERE id = ?",
+            (user_id,),
+        )
+        conn.commit()
     finally:
         conn.close()

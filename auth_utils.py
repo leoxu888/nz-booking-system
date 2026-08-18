@@ -41,6 +41,14 @@ def verify_password(pw: str, hashed: str) -> bool:
 
 
 def create_token(payload: dict, expires_hours: int = TOKEN_TTL_HOURS) -> str:
+    """签发 JWT。调用方必须把以下字段传入 payload：
+    - sub: 用户 id（int，自动转 str）
+    - shop_id: 店铺 id（商家）或 None（超管）
+    - role: 'shop_owner' | 'super_admin'
+    - token_version: 用户当前 token_version（商家必带；超管可省，
+      鉴权层对超管跳过版本校验）
+    版本号不一致的旧 Token 会在鉴权时被拒绝（强制失效机制）。
+    """
     exp = datetime.now(timezone.utc).timestamp() + expires_hours * 3600
     payload = {**payload, "exp": exp}
     # PyJWT 要求 sub(主题) 必须是字符串，统一转 str

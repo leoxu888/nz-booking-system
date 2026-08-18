@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from database import (get_conn, init_db, SHOP_TZ, slugify,
                      day_hours, DEFAULT_OPENING_HOURS,
                      add_blackout, remove_blackout, list_blackouts,
+                     get_user_token_version, increment_user_token_version,
                      IntegrityError)
 from auth_utils import (hash_password, verify_password, create_token, decode_token,
                         secure_compare, SECRET_KEY)
@@ -64,8 +65,31 @@ def _cache_set(key, val):
         _CACHE.clear()  # 防御：缓存条目过多时整体清空（简单策略，避免内存膨胀）
 
 
+# ---------- token_version 短 TTL 缓存（JWT 强制失效用） ----------
+# 每次鉴权都要比对 token_version，5s 缓存避免高频查库；改密/登出时立即失效。
+_TV_CACHE = {}
+_TV_TTL = 5  # 秒
+
+
+def _tv_get(user_id: int) -> int:
+    hit = _TV_CACHE.get(user_id)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    v = get_user_token_version(user_id)
+    _TV_CACHE[user_id] = (time.time() + _TV_TTL, v)
+    return v
+
+
+def _tv_invalidate(user_id: int):
+    _TV_CACHE.pop(user_id, None)
+
+
+
 # ---------- 简易内存限流（防暴力破解 / 刷单 / 刷 AI 配额） ----------
 _RATE = {}  # key -> [timestamps]
+# 测试环境下可整体关闭（test_multitenant.py 设置 RATE_LIMIT_DISABLED=1，
+# 避免同 IP 的多次登录/下单触发 429 干扰其它断言）
+_RATE_LIMIT_DISABLED = os.getenv("RATE_LIMIT_DISABLED") == "1"
 _RATE_LIMITS = {
     "login": (5, 300),      # 登录：每 IP 5 次 / 5 分钟
     "booking": (10, 60),    # 顾客下单：每 IP 10 次 / 分钟
@@ -75,6 +99,8 @@ _RATE_LIMITS = {
 
 
 def _rate_limit(key: str, limit: tuple):
+    if _RATE_LIMIT_DISABLED:
+        return
     max_n, window = limit
     now = time.time()
     lst = _RATE.setdefault(key, [])
@@ -200,6 +226,15 @@ class RescheduleIn(BaseModel):
     service_id: int = None
     customer_name: str = Field(default=None, max_length=100)
     customer_email: str = Field(default=None, max_length=200)
+
+
+class ChangePasswordIn(BaseModel):
+    old_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+class ResetPasswordIn(BaseModel):
+    new_password: str = Field(min_length=8, max_length=200)
 
 
 # ---------- 工具函数 ----------
@@ -520,14 +555,29 @@ def email_reschedule(slug, bid, shop_name, service_name, name, email,
 
 # ---------- JWT 鉴权依赖 ----------
 def get_current_user(request: Request):
-    """从 Bearer token 解码出当前登录用户，失败返回 401。"""
+    """从 Bearer token 解码出当前登录用户，失败返回 401。
+    商家 Token 额外校验 token_version：改密/登出/超管重置后版本号自增，
+    旧 Token 立即失效（强制失效机制）。超管无 users 行，跳过版本校验。
+    """
     tok = request.headers.get("Authorization", "")
     if tok.startswith("Bearer "):
         tok = tok[7:]
     data = decode_token(tok)
     if not data:
         raise HTTPException(401, "unauthorized")
-    return data  # 含 sub(user_id), shop_id, role
+    role = data.get("role")
+    if role != "super_admin":
+        # 平滑迁移：缺失 token_version 的旧 Token 一律判定失效，要求重新登录
+        tv = data.get("token_version")
+        if tv is None:
+            raise HTTPException(401, "Token has been revoked or session expired")
+        try:
+            uid = int(data.get("sub") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(401, "unauthorized")
+        if uid <= 0 or int(tv) != _tv_get(uid):
+            raise HTTPException(401, "Token has been revoked or session expired")
+    return data  # 含 sub(user_id), shop_id, role, token_version
 
 
 def require_role(request: Request, role: str):
@@ -1188,8 +1238,48 @@ def admin_login(request: Request, body: OwnerLogin):
         raise HTTPException(401, "wrong username or password")
     if not shop_active:
         raise HTTPException(403, "该店铺已被停用，请联系平台管理员")
-    token = create_token({"sub": row["id"], "shop_id": row["shop_id"], "role": row["role"]})
+    token = create_token({
+        "sub": row["id"],
+        "shop_id": row["shop_id"],
+        "role": row["role"],
+        "token_version": get_user_token_version(row["id"]),
+    })
     return {"token": token}
+
+
+@app.post("/api/admin/change-password")
+def admin_change_password(request: Request, body: ChangePasswordIn):
+    """老板修改自己的密码。成功后自增 token_version → 其它设备上的旧 Token 全部失效。"""
+    u = get_current_user(request)
+    uid = int(u["sub"])
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE id = ? AND shop_id = ?",
+            (uid, u["shop_id"]),
+        ).fetchone()
+        if not row or not verify_password(body.old_password, row["password_hash"]):
+            raise HTTPException(400, "旧密码不正确")
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(body.new_password), uid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    increment_user_token_version(uid)
+    _tv_invalidate(uid)
+    return {"ok": True, "message": "密码已修改，其他设备的登录已全部失效"}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(request: Request):
+    """主动登出：自增 token_version，让当前及所有已签发 Token 立即失效。"""
+    u = get_current_user(request)
+    uid = int(u["sub"])
+    increment_user_token_version(uid)
+    _tv_invalidate(uid)
+    return {"ok": True, "message": "已登出，所有会话已失效"}
 
 
 @app.get("/api/admin/shop")
@@ -1693,6 +1783,30 @@ def delete_shop(request: Request, sid: int):
     if slug_row:
         _cache_set(f"shop:{slug_row['slug']}", None)
     return {"ok": True, "id": sid, "deleted": True}
+
+
+@app.post("/api/super-admin/shops/{sid}/reset-password")
+def super_admin_reset_password(request: Request, sid: int, body: ResetPasswordIn):
+    """超管重置某店铺老板的密码。成功后自增该老板 token_version → 其所有旧 Token 失效。"""
+    require_role(request, "super_admin")
+    conn = get_conn()
+    try:
+        owner = conn.execute(
+            "SELECT id FROM users WHERE shop_id = ? AND role = 'shop_owner' LIMIT 1",
+            (sid,),
+        ).fetchone()
+        if not owner:
+            raise HTTPException(404, "该店铺没有老板账号")
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(body.new_password), owner["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    increment_user_token_version(owner["id"])
+    _tv_invalidate(owner["id"])
+    return {"ok": True, "id": sid, "message": "密码已重置，该老板的所有会话已失效"}
 
 
 # ---------- 首次运行：种入演示店铺（方便立刻体验） ----------

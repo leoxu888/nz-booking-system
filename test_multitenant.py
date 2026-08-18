@@ -8,6 +8,10 @@ os.environ["DB_PATH"] = "/tmp/mt_test.db"
 os.environ["SUPER_ADMIN_PASSWORD"] = "super123"
 os.environ["SHOP_TZ"] = "Pacific/Auckland"
 os.environ["PUBLIC_URL"] = "http://localhost:8000"
+# 强制走 SQLite（项目里的 .env 若含 DATABASE_URL，load_dotenv 会覆盖不到已存在的键）
+os.environ["DATABASE_URL"] = ""
+# 关闭限流，避免同 IP 的多次登录/下单触发 429 干扰其它断言
+os.environ["RATE_LIMIT_DISABLED"] = "1"
 # 故意不设置 GEMINI_API_KEY -> 走本地兜底解析，结果 deterministic
 
 import shutil
@@ -369,6 +373,66 @@ with TestClient(main.app) as client:
     check("老顾客：Henry 有 2 次到店记录", len(henry) == 2)
     check("老顾客：visits>=2 且 returning=true",
           all(b.get("visits", 0) >= 2 and b.get("returning") is True for b in henry))
+
+    # ---------- 20. JWT Token 强制失效（token_version 机制） ----------
+    from auth_utils import create_token, decode_token
+
+    # 20a. 登录 token 携带 token_version
+    r = client.post("/api/admin/login", json={"username": "bossA", "password": "pwA123"})
+    tokenA_tv = r.json()["token"]
+    payload = decode_token(tokenA_tv)
+    check("20a Token payload 含 token_version", payload is not None and "token_version" in payload)
+
+    # 20b. 平滑迁移：旧格式 Token（无 token_version）→ 401
+    legacy = create_token({"sub": 2, "shop_id": 2, "role": "shop_owner"})
+    r = client.get("/api/admin/shop", headers={"Authorization": f"Bearer {legacy}"})
+    check("20b 旧格式 Token(无 token_version) -> 401", r.status_code == 401)
+
+    # 20c. 修改密码 → 旧 Token 立即失效；新密码可重新登录
+    r = client.post("/api/admin/change-password",
+        headers={"Authorization": f"Bearer {tokenA_tv}"},
+        json={"old_password": "pwA123", "new_password": "pwANew789"})
+    check("20c 修改密码成功 -> 200", r.status_code == 200)
+    r = client.get("/api/admin/shop", headers={"Authorization": f"Bearer {tokenA_tv}"})
+    check("20c 改密后旧 Token -> 401", r.status_code == 401)
+    r = client.post("/api/admin/login", json={"username": "bossA", "password": "pwANew789"})
+    check("20c 新密码登录成功", r.status_code == 200)
+    tokenA_new = r.json()["token"]
+    r = client.get("/api/admin/shop", headers={"Authorization": f"Bearer {tokenA_new}"})
+    check("20c 新 Token 可用 -> 200", r.status_code == 200)
+    # 还原密码，避免影响后续测试
+    client.post("/api/admin/change-password",
+        headers={"Authorization": f"Bearer {tokenA_new}"},
+        json={"old_password": "pwANew789", "new_password": "pwA123"})
+
+    # 20d. 主动登出 → 当前 Token 失效
+    r = client.post("/api/admin/login", json={"username": "bossB", "password": "pwB123"})
+    tokenB2 = r.json()["token"]
+    r = client.post("/api/admin/logout", headers={"Authorization": f"Bearer {tokenB2}"})
+    check("20d 主动登出 -> 200", r.status_code == 200)
+    r = client.get("/api/admin/shop", headers={"Authorization": f"Bearer {tokenB2}"})
+    check("20d 登出后旧 Token -> 401", r.status_code == 401)
+    r = client.post("/api/admin/login", json={"username": "bossB", "password": "pwB123"})
+    tokenB = r.json()["token"]  # 更新 tokenB 供后续使用
+
+    # 20e. 超管重置商家密码 → 该商家旧 Token 失效
+    r = client.post(f"/api/super-admin/shops/{rB.json()['shop_id']}/reset-password",
+        headers={"Authorization": f"Bearer {super_token}"},
+        json={"new_password": "pwBReset9"})
+    check("20e 超管重置密码 -> 200", r.status_code == 200)
+    r = client.get("/api/admin/shop", headers={"Authorization": f"Bearer {tokenB}"})
+    check("20e 重置后商家旧 Token -> 401", r.status_code == 401)
+    r = client.post("/api/admin/login", json={"username": "bossB", "password": "pwBReset9"})
+    check("20e 重置后新密码登录成功", r.status_code == 200)
+    tokenB = r.json()["token"]
+    # 还原密码
+    client.post("/api/admin/change-password",
+        headers={"Authorization": f"Bearer {tokenB}"},
+        json={"old_password": "pwBReset9", "new_password": "pwB123"})
+
+    # 20f. 超管 Token 不受版本机制影响（无 users 行）
+    r = client.get("/api/super-admin/shops", headers={"Authorization": f"Bearer {super_token}"})
+    check("20f 超管 Token 始终有效 -> 200", r.status_code == 200)
 
 print(f"\n==== {passed} checks passed, {failed} failed ====")
 if failed:
